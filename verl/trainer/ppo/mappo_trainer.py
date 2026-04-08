@@ -58,6 +58,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 import verl.utils.torch_functional as verl_F
+from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_response_mask
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
@@ -266,7 +267,7 @@ class RayMAPPOTrainer:
 
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
-            val_batch_size = len(self.val_datasets["model_0"])
+            val_batch_size = len(next(iter(self.val_datasets.values())))
 
         self.val_dataloaders={}
         for i in range(num_agents):
@@ -1263,17 +1264,15 @@ class RayMAPPOTrainer:
             q = re.sub(r"\s+", " ", q)  # 合并多个空格为1个
             
             questions.append(q)
-        # Step 3: extract system prompts
-        match = re.search(r"system(.*?)user", prompt, flags=re.DOTALL | re.IGNORECASE)
+        # Step 3: extract system prompt from the first sample (it is a constant per batch)
+        first_prompt = prompts[0] if prompts else ""
+        match = re.search(r"system(.*?)user", first_prompt, flags=re.DOTALL | re.IGNORECASE)
         if match:
-                system_prompt = match.group(1)
+            system_prompt = match.group(1)
         else:
-            # 如果没找到，就返回整个 prompt
-            system_prompt = prompt
-            
-            # Step 3: 清理换行符和多余空格
-            system_prompt = system_prompt.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
-            system_prompt = re.sub(r"\s+", " ", system_prompt)  # 合并多个空格为1个
+            system_prompt = first_prompt
+        system_prompt = system_prompt.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
+        system_prompt = re.sub(r"\s+", " ", system_prompt)
         return questions, system_prompt
     
     def _build_input_ids_from_histories(self,system_prompt,discussion_prompt,questions,histories,batch:DataProto,agent_key,max_history_tokens):
@@ -1509,6 +1508,10 @@ class RayMAPPOTrainer:
         return resp_texts,batch
     def _compute_reward(self, batch: DataProto, reward_fn) -> tuple[torch.Tensor, dict]:
         """Call reward_fn synchronously and return (reward_tensor, reward_extra_infos_dict)."""
+        if reward_fn is None:
+            raise ValueError(
+                "reward_fn cannot be None. Ensure self.reward_fns[agent_key] or self.reward_fn is set."
+            )
         reward_result = reward_fn(batch, return_dict=True)
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
@@ -1772,6 +1775,15 @@ class RayMAPPOTrainer:
 
                 # safety: if some sample has no response tokens, do nothing for that sample
                 has_resp = rmask.any(dim=1)
+                n_missing = int((~has_resp).sum().item())
+                if n_missing > 0:
+                    import warnings
+                    warnings.warn(
+                        f"back_propogate_reward: {n_missing} sample(s) have no response tokens "
+                        f"in round {r}, agent {a}. Their rewards will not be updated.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
                 scores[rows[has_resp], last_resp_idx[has_resp]] = rewards[r][a][has_resp].to(scores.dtype)
     
     def _update_critic(self,r,agent_idx,agent_key,round_agent_batches,timing_raw,round_agent_metrics):
@@ -1976,7 +1988,8 @@ class RayMAPPOTrainer:
                                         round_agent_metrics
                                     )
                                 )
-                        results = [f.result() for f in futures]
+                        for f in futures:
+                            f.result()  # propagate exceptions
                 # implement critic warmup
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     # update actor
@@ -1995,24 +2008,19 @@ class RayMAPPOTrainer:
                                         round_agent_metrics
                                     )
                                 )
-                        results = [f.result() for f in futures]
-                # collect metrics per agent with prefix
+                        for f in futures:
+                            f.result()  # propagate exceptions
+                # collect metrics per agent with prefix (serial — avoids race on metrics dict)
                 for r in range(num_rounds):
-                    futures=[]
-                    with ThreadPoolExecutor(max_workers=num_agents) as executor:        
-                        for agent_idx in range(num_agents):
-                            futures.append(
-                                executor.submit(
-                                    self._update_metrics,
-                                    r,
-                                    agent_idx,
-                                    round_agent_batches,
-                                    round_agent_metrics,
-                                    timing_raw,
-                                    metrics
-                                )
-                            )
-                        results = [f.result() for f in futures]
+                    for agent_idx in range(num_agents):
+                        self._update_metrics(
+                            r,
+                            agent_idx,
+                            round_agent_batches,
+                            round_agent_metrics,
+                            timing_raw,
+                            metrics,
+                        )
                 # validate
                 if (
                     self.val_reward_fns is not None
