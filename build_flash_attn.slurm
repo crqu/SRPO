@@ -11,7 +11,7 @@
 #SBATCH --output=logs/build_flash_attn_%j.log
 #SBATCH --error=logs/build_flash_attn_%j.log
 
-set -euxo pipefail
+set -exo pipefail
 
 REPO_DIR=/weka/scratch/lshi40_llm/mallm/SRPO
 BUILD_DIR=/tmp/flash-attn-build-${SLURM_JOB_ID}
