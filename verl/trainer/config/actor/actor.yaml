@@ -86,10 +86,10 @@ loss_agg_mode: token-mean
 loss_scale_factor: null
 
 # Entropy regularization coefficient in PPO loss
-entropy_coeff: 0
+entropy_coeff: 0.01
 
 # When true, the actor forward will request entropy from the model
-calculate_entropy: false
+calculate_entropy: true
 
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
@@ -102,7 +102,7 @@ use_prefix_grouper: false
 use_torch_compile: true
 
 # KL loss coefficient when use_kl_loss is enabled. For GRPO
-kl_loss_coef: 0.001
+kl_loss_coef: 0.01
 
 # Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
 kl_loss_type: low_var_kl

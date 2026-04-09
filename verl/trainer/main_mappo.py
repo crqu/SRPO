@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.mappo_trainer import RayMAPPOTrainer, create_rl_dataset, create_rl_sampler
+from verl.trainer.ppo.mappo_trainer import RayMAPPOTrainer, RayRiskAverseTrainer, create_rl_dataset, create_rl_sampler
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -345,7 +345,10 @@ class TaskRunner:
 
 
         # Initialize the PPO trainer.
-        trainer = RayMAPPOTrainer(
+        ma = OmegaConf.select(config, "multi_agent", default={}) or {}
+        trainer_type = ma.get("trainer_type", "mappo")
+        TrainerCls = RayRiskAverseTrainer if trainer_type == "risk_averse" else RayMAPPOTrainer
+        trainer = TrainerCls(
             config=config,
             tokenizers=tokenizers,
             processors=processors,
