@@ -1738,9 +1738,12 @@ class RayMAPPOTrainer:
         del gen_batch_output, batch
 
         return resp_texts, agent_metrics
-    def back_propogate_reward(self,num_rounds,num_agents,round_agent_batches,gamma):
-        # ---- Step 0: 预先把所有 reward.sum(-1) 缓存起来（避免重复计算） ----
-        # rewards[r][a] = [B] reward vector
+    def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
+        assert num_agents == 2, (
+            "back_propogate_reward requires exactly 2 agents "
+            "(risk-averse at index 0, adversary at index 1)"
+        )
+        # Cache scalar rewards: rewards[r][a] shape [B]
         rewards = [
             [
                 round_agent_batches[r][a].batch["token_level_scores"].sum(-1)
@@ -1749,31 +1752,23 @@ class RayMAPPOTrainer:
             for r in range(num_rounds)
         ]
 
-        # ---- Step 1: backward pass ----
-        coef = gamma / num_agents    # constant
-        for r in range(num_rounds - 2, 0, -1):
-            # precompute the future-sum across all agents ONCE
-            # future_sum = Σ_a reward_{r+1}^{(a)}
-            future_sum = sum(rewards[r+1])       # shape [B]
+        for r in range(num_rounds - 2, -1, -1):
+            # Agent 0 (risk-averse): base reward + discounted own future reward
+            rewards[r][0] = rewards[r][0] + gamma * rewards[r + 1][0]
+            # Agent 1 (adversary): negated agent 0's next-round reward
+            rewards[r][1] = -rewards[r + 1][0]
 
-            # for each agent, compute reward_to_go (no more inner sum loop)
+            # Write updated reward back to the last response token of each agent
             for a in range(num_agents):
-                base_reward = rewards[r][a]      # shape [B]
-                rewards[r][a] = base_reward + coef * future_sum
-
-                # write back only to last token 
                 batch = round_agent_batches[r][a]
-                scores = batch.batch["token_level_scores"]                 # [B, T]
-                rmask  = batch.batch["response_mask"].bool()               # [B, T]
+                scores = batch.batch["token_level_scores"]    # [B, T]
+                rmask  = batch.batch["response_mask"].bool()  # [B, T]
 
                 B, T = scores.shape
                 rows = torch.arange(B, device=scores.device)
-
-                # last index where response_mask == 1
                 idx = torch.arange(T, device=scores.device).unsqueeze(0).expand(B, T)
                 last_resp_idx = (idx * rmask.long()).max(dim=1).values  # [B]
 
-                # safety: if some sample has no response tokens, do nothing for that sample
                 has_resp = rmask.any(dim=1)
                 n_missing = int((~has_resp).sum().item())
                 if n_missing > 0:
@@ -1784,7 +1779,9 @@ class RayMAPPOTrainer:
                         UserWarning,
                         stacklevel=2,
                     )
-                scores[rows[has_resp], last_resp_idx[has_resp]] = rewards[r][a][has_resp].to(scores.dtype)
+                scores[rows[has_resp], last_resp_idx[has_resp]] = (
+                    rewards[r][a][has_resp].to(scores.dtype)
+                )
     
     def _update_critic(self,r,agent_idx,agent_key,round_agent_batches,timing_raw,round_agent_metrics):
         with marked_timer("update_critic", timing_raw, color="pink"):
@@ -1977,6 +1974,8 @@ class RayMAPPOTrainer:
                         futures=[]
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx,agent_key in enumerate(agent_keys):
+                                if r == num_rounds - 1 and agent_idx == 1:
+                                    continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
                                         self._update_critic,
@@ -1997,6 +1996,8 @@ class RayMAPPOTrainer:
                         futures=[]
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx,agent_key in enumerate(agent_keys):
+                                if r == num_rounds - 1 and agent_idx == 1:
+                                    continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
                                         self._update_actor,

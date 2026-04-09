@@ -144,16 +144,15 @@ def test_back_propagate_reward_warns_on_empty_response():
         batch.batch = {"token_level_scores": scores, "response_mask": rmask}
         return batch
 
-    # num_rounds=3 so backward pass iterates r=1 (range(num_rounds-2, 0, -1))
     round_agent_batches = [
-        [_make_mock_batch(has_response_for_sample_1=True)],   # r=0
-        [_make_mock_batch(has_response_for_sample_1=False)],  # r=1 — triggers warning
-        [_make_mock_batch(has_response_for_sample_1=True)],   # r=2
+        [_make_mock_batch(True),  _make_mock_batch(True)],   # r=0
+        [_make_mock_batch(False), _make_mock_batch(True)],   # r=1: sample 1 missing on agent 0
+        [_make_mock_batch(True),  _make_mock_batch(True)],   # r=2
     ]
 
     with pytest.warns(UserWarning, match="no response tokens"):
         trainer.back_propogate_reward(
-            num_rounds=3, num_agents=1,
+            num_rounds=3, num_agents=2,
             round_agent_batches=round_agent_batches,
             gamma=1.0,
         )
@@ -396,45 +395,47 @@ def _make_score_batch(scores_at_last_token: list[float], T: int = 4, resp_pos: i
     return batch
 
 
-def test_back_propagate_reward_two_rounds_no_update():
-    """With num_rounds=2, range(0,0,-1) is empty — no scores modified."""
+def test_back_propagate_reward_two_rounds_round_zero_updated():
+    """With num_rounds=2, round 0 IS updated (loop covers r=0)."""
     trainer = _make_trainer()
 
-    r0a0 = _make_score_batch([1.0, 2.0])
-    r1a0 = _make_score_batch([5.0, 6.0])
-
-    original_r0 = r0a0.batch["token_level_scores"].clone()
-    original_r1 = r1a0.batch["token_level_scores"].clone()
+    r1a0 = _make_score_batch([10.0, 20.0])   # final round, agent 0
+    r1a1 = _make_score_batch([30.0, 40.0])   # final round, agent 1
+    r0a0 = _make_score_batch([ 1.0,  2.0])   # round 0, agent 0
+    r0a1 = _make_score_batch([ 3.0,  4.0])   # round 0, agent 1
 
     trainer.back_propogate_reward(
-        num_rounds=2, num_agents=1,
-        round_agent_batches=[[r0a0], [r1a0]],
+        num_rounds=2, num_agents=2,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1]],
         gamma=1.0,
     )
 
-    # Neither round should be modified (loop doesn't execute for num_rounds=2)
-    assert torch.allclose(r0a0.batch["token_level_scores"], original_r0)
-    assert torch.allclose(r1a0.batch["token_level_scores"], original_r1)
+    # Agent 0 at r=0: base + γ * rewards[1][0] = [1+10, 2+20]
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([11.0, 22.0]))
+    # Agent 1 at r=0: -rewards[1][0] = [-10, -20]
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([-10.0, -20.0]))
+    # Final round must be unchanged
+    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
 
 
 def test_back_propagate_reward_three_rounds_two_agents_values():
     """
-    num_rounds=3, num_agents=2, gamma=1.0 — verify exact reward math at r=1.
+    num_rounds=3, num_agents=2, gamma=1.0 — asymmetric adversarial back-prop.
 
-    Initial sum-rewards (only last token is nonzero):
-      r=2, a=0: [10, 20]
-      r=2, a=1: [30, 40]
-      r=1, a=0: [ 1,  2]
-      r=1, a=1: [ 3,  4]
+    Initial last-token scores:
+      r=2, a=0: [10, 20]   r=1, a=0: [1, 2]   r=0, a=0: [7,  8]
+      r=2, a=1: [30, 40]   r=1, a=1: [3, 4]   r=0, a=1: [9, 11]
 
-    coef = gamma / num_agents = 1.0 / 2 = 0.5
-    future_sum at r=2 = [10+30, 20+40] = [40, 60]
+    After r=1 pass:
+      rewards[1][0] = [1 + 1.0*10, 2 + 1.0*20] = [11, 22]
+      rewards[1][1] = [-10, -20]
 
-    After back-prop (r=1):
-      rewards[1][0] = [1 + 0.5*40, 2 + 0.5*60] = [21, 32]
-      rewards[1][1] = [3 + 0.5*40, 4 + 0.5*60] = [23, 34]
+    After r=0 pass:
+      rewards[0][0] = [7 + 1.0*11, 8 + 1.0*22] = [18, 30]
+      rewards[0][1] = [-11, -22]
 
-    r=0 must NOT be modified.
+    r=2 must be unchanged.
     """
     trainer = _make_trainer()
 
@@ -445,57 +446,44 @@ def test_back_propagate_reward_three_rounds_two_agents_values():
     r0a0 = _make_score_batch([ 7.0,  8.0])
     r0a1 = _make_score_batch([ 9.0, 11.0])
 
-    original_r0a0 = r0a0.batch["token_level_scores"].clone()
-    original_r0a1 = r0a1.batch["token_level_scores"].clone()
-
-    round_agent_batches = [
-        [r0a0, r0a1],
-        [r1a0, r1a1],
-        [r2a0, r2a1],
-    ]
-
     trainer.back_propogate_reward(
         num_rounds=3, num_agents=2,
-        round_agent_batches=round_agent_batches,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
         gamma=1.0,
     )
 
-    # r=1 last-token scores after write-back
-    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([21.0, 32.0]))
-    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([23.0, 34.0]))
-
-    # r=2 must be unchanged (no future round)
+    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([11.0, 22.0]))
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([-10.0, -20.0]))
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([18.0, 30.0]))
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([-11.0, -22.0]))
+    # final round unchanged
     assert torch.allclose(r2a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
     assert torch.allclose(r2a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
 
-    # r=0 must be unchanged (loop starts at num_rounds-2=1, so r=0 is skipped)
-    assert torch.allclose(r0a0.batch["token_level_scores"], original_r0a0)
-    assert torch.allclose(r0a1.batch["token_level_scores"], original_r0a1)
-
 
 def test_back_propagate_reward_gamma_scaling():
-    """gamma < 1.0 reduces the propagated credit proportionally."""
+    """gamma < 1.0 scales agent 0's credit; agent 1 negation is unaffected by gamma."""
     trainer = _make_trainer()
 
     r2a0 = _make_score_batch([100.0, 100.0])
+    r2a1 = _make_score_batch([  0.0,   0.0])
     r1a0 = _make_score_batch([  0.0,   0.0])
+    r1a1 = _make_score_batch([  0.0,   0.0])
     r0a0 = _make_score_batch([  0.0,   0.0])
+    r0a1 = _make_score_batch([  0.0,   0.0])
 
-    round_agent_batches = [[r0a0], [r1a0], [r2a0]]
-
-    gamma = 0.5
-    # coef = 0.5 / 1 = 0.5
-    # future_sum = [100, 100]
-    # new rewards[1][0] = 0 + 0.5 * 100 = 50 for each sample
-
+    # r=1: rewards[1][0] = 0 + 0.5*100 = 50;  rewards[1][1] = -100
+    # r=0: rewards[0][0] = 0 + 0.5*50  = 25;  rewards[0][1] = -50
     trainer.back_propogate_reward(
-        num_rounds=3, num_agents=1,
-        round_agent_batches=round_agent_batches,
-        gamma=gamma,
+        num_rounds=3, num_agents=2,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
+        gamma=0.5,
     )
 
-    expected = torch.tensor([50.0, 50.0])
-    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], expected)
+    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([ 50.0,  50.0]))
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([-100.0, -100.0]))
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([ 25.0,  25.0]))
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([-50.0, -50.0]))
 
 
 def test_back_propagate_reward_only_updates_last_response_token():
@@ -513,27 +501,37 @@ def test_back_propagate_reward_only_updates_last_response_token():
         batch.batch = {"token_level_scores": scores, "response_mask": rmask}
         return batch
 
-    # Response tokens at different positions per sample
     r2a0 = _batch_with_custom_mask([2, 4], [10.0, 20.0])
-    r1a0 = _batch_with_custom_mask([1, 3], [1.0, 2.0])
-    r0a0 = _batch_with_custom_mask([0, 5], [0.0, 0.0])
+    r2a1 = _batch_with_custom_mask([2, 4], [ 0.0,  0.0])
+    r1a0 = _batch_with_custom_mask([1, 3], [ 1.0,  2.0])
+    r1a1 = _batch_with_custom_mask([1, 3], [ 0.0,  0.0])
+    r0a0 = _batch_with_custom_mask([0, 5], [ 0.0,  0.0])
+    r0a1 = _batch_with_custom_mask([0, 5], [ 0.0,  0.0])
 
     trainer.back_propogate_reward(
-        num_rounds=3, num_agents=1,
-        round_agent_batches=[[r0a0], [r1a0], [r2a0]],
+        num_rounds=3, num_agents=2,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
         gamma=1.0,
     )
 
-    s = r1a0.batch["token_level_scores"]
-    # Sample 0: last resp token at pos 1, expected value = 1 + 1.0/1 * 10 = 11
-    assert s[0, 1].item() == pytest.approx(11.0)
-    # Sample 1: last resp token at pos 3, expected value = 2 + 1.0/1 * 20 = 22
-    assert s[1, 3].item() == pytest.approx(22.0)
-    # All other positions in r=1 must remain zero
+    s0 = r1a0.batch["token_level_scores"]
+    # Sample 0: last resp at pos 1; agent 0 = 1 + 10 = 11
+    assert s0[0, 1].item() == pytest.approx(11.0)
+    # Sample 1: last resp at pos 3; agent 0 = 2 + 20 = 22
+    assert s0[1, 3].item() == pytest.approx(22.0)
     for b in range(B):
         for t in range(T):
             if not r1a0.batch["response_mask"][b, t]:
-                assert s[b, t].item() == pytest.approx(0.0)
+                assert s0[b, t].item() == pytest.approx(0.0)
+
+    s1 = r1a1.batch["token_level_scores"]
+    # Agent 1 at r=1: -rewards[2][0] = [-10, -20]
+    assert s1[0, 1].item() == pytest.approx(-10.0)
+    assert s1[1, 3].item() == pytest.approx(-20.0)
+    for b in range(B):
+        for t in range(T):
+            if not r1a1.batch["response_mask"][b, t]:
+                assert s1[b, t].item() == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -610,3 +608,20 @@ def test_extract_prompts_whitespace_is_normalized():
 
 
 import pytest
+
+
+def test_adversary_skipped_at_final_round():
+    """mappo_fit must contain a guard that skips agent 1 updates at the final round."""
+    import inspect
+    import re
+    import verl.trainer.ppo.mappo_trainer as mod
+
+    src = inspect.getsource(mod.RayMAPPOTrainer.mappo_fit)
+
+    assert re.search(
+        r"num_rounds\s*-\s*1\s*and\s*agent_idx\s*==\s*1",
+        src,
+    ), (
+        "mappo_fit must skip agent_idx==1 updates at the final round. "
+        "Expected pattern: 'num_rounds - 1 and agent_idx == 1'"
+    )
