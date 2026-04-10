@@ -201,7 +201,7 @@ class RayMAPPOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = self.config.algorithm.use_kl_in_reward
-        self.use_rm = need_reward_model(self.role_worker_mapping)
+        self.use_rm = need_reward_model(self.config)
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
@@ -1057,7 +1057,7 @@ class RayMAPPOTrainer:
             self.async_rollout_managers={}
             for i in range(num_agents):
                 self.async_rollout_managers[f"model_{i}"] = AgentLoopManager(
-                    config=self.config, worker_group=self.actor_rollout_wgs[f"model_{i}"], rm_wg=self.rm_wg
+                    config=self.config, worker_group=self.actor_rollout_wgs[f"model_{i}"]
                 )
     
     # multi-agent
@@ -2515,7 +2515,7 @@ class RayZOTrainer:
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
-        self.use_rm = need_reward_model(self.role_worker_mapping)
+        self.use_rm = need_reward_model(self.config)
         self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device

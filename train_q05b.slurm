@@ -7,14 +7,15 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=100G
-#SBATCH --partition=nvl,h100,l40s
+#SBATCH --partition=nvl,l40s
 #SBATCH --gres=gpu:1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
-#SBATCH --output=logs/%x_%j_${METHOD:-ippo}.output
-#SBATCH --error=logs/%x_%j_${METHOD:-ippo}.error
+#SBATCH --output=logs/%x_%j.output
+#SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
+#SBATCH --exclude=n05
 
 set -x
 
@@ -123,6 +124,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         data.train_batch_size=256 \
         data.max_prompt_length=2048 \
         data.max_response_length=512 \
+        data.seed=42 \
         multi_agent.trainer_type=${TRAINER_TYPE} \
         multi_agent.agents.0.actor.model.path=${MODEL_NAME} \
         multi_agent.agents.1.actor.model.path=${MODEL_NAME} \
@@ -140,6 +142,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         actor_rollout_ref.model.lora_rank=32 \
         actor_rollout_ref.model.lora_alpha=32 \
         actor_rollout_ref.model.target_modules=all-linear \
+        critic.model.path=${MODEL_NAME} \
         critic.optim.lr=1e-5 \
         critic.ppo_micro_batch_size_per_gpu=4 \
         algorithm.kl_ctrl.kl_coef=${KL_COEF} \
