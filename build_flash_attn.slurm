@@ -4,9 +4,9 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=32G
-#SBATCH --time=02:00:00
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
+#SBATCH --time=04:00:00
 #SBATCH --partition=nvl,l40s
 #SBATCH --output=logs/build_flash_attn_%j.log
 #SBATCH --error=logs/build_flash_attn_%j.log
@@ -39,7 +39,7 @@ cd "${BUILD_DIR}"
 
 # Build configuration
 export TORCH_CUDA_ARCH_LIST="8.0;8.9;9.0"   # A100 / L40S / H100
-export MAX_JOBS=8
+export MAX_JOBS=16
 export FLASH_ATTENTION_SKIP_CUDA_BUILD=FALSE
 
 echo "[INFO] Building wheel (this takes ~30-60 min)..."
