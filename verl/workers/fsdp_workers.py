@@ -159,8 +159,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if not torch.distributed.is_initialized():
             rank = int(os.environ.get("RANK", 0))
             world_size = int(os.environ.get("WORLD_SIZE", 1))
+            _device_name = get_device_name()
+            if _device_name == "cpu":
+                _dist_backend = "gloo"
+            else:
+                _dist_backend = f"cpu:gloo,{_device_name}:{get_nccl_backend()}"
             torch.distributed.init_process_group(
-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+                backend=_dist_backend,
                 rank=rank,
                 world_size=world_size,
                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
@@ -395,7 +400,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         # override model kwargs
-        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
+        try:
+            import flash_attn  # noqa: F401
+
+            _default_attn = "flash_attention_2"
+        except ImportError:
+            _default_attn = "sdpa"
+        attn_implementation = override_model_config.get("attn_implementation", _default_attn)
         actor_model_config = AutoConfig.from_pretrained(
             local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
         )
@@ -1339,7 +1350,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         world_size = torch.distributed.get_world_size()
         from torch.distributed.device_mesh import init_device_mesh
 
-        fsdp_size = self.config.model.fsdp_config.fsdp_size
+        fsdp_size = self.config.fsdp.fsdp_size
         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
 
         self.ulysses_device_mesh = None
@@ -1362,8 +1373,8 @@ class CriticWorker(Worker, DistProfilerExtension):
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
 
         # set FSDP offload params
-        self._is_offload_param = self.config.model.fsdp_config.param_offload
-        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+        self._is_offload_param = self.config.fsdp.param_offload
+        self._is_offload_optimizer = self.config.fsdp.optimizer_offload
 
         # normalize config
         self.config.ppo_mini_batch_size *= self.config.rollout_n
@@ -1390,7 +1401,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         self._is_lora = (
             self.config.model.get("lora_adapter_path") is not None or self.config.model.get("lora_rank", 0) > 0
         )
-        self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
+        self.use_orig_params = self.config.fsdp.get("use_orig_params", False)
 
     def _build_critic_model_optimizer(self, config: FSDPCriticConfig):
         # the following line is necessary
@@ -1404,7 +1415,7 @@ class CriticWorker(Worker, DistProfilerExtension):
         # note that the tokenizer between actor and critic may be different. So override tokenizer info with actor info
         # using random initialized model from any architecture. May not be the same as Actor.
 
-        tokenizer_path = copy_to_local(config.model.tokenizer_path, use_shm=use_shm)
+        tokenizer_path = copy_to_local(config.model.tokenizer_path, use_shm=use_shm) if config.model.tokenizer_path else local_path
         self.tokenizer = hf_tokenizer(tokenizer_path, trust_remote_code=config.model.get("trust_remote_code", False))
         self.processor = hf_processor(tokenizer_path, trust_remote_code=config.model.get("trust_remote_code", False))
 
@@ -1423,13 +1434,19 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self.rank == 0:
             print(f"Critic overriding config {override_config_kwargs}")
 
-        torch_dtype = self.config.model.fsdp_config.get("model_dtype", "fp32")
+        torch_dtype = self.config.fsdp.get("model_dtype", "fp32")
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
         from transformers import AutoConfig
 
         # override model kwargs
-        attn_implementation = override_config.get("attn_implementation", "flash_attention_2")
+        try:
+            import flash_attn  # noqa: F401
+
+            _default_attn = "flash_attention_2"
+        except ImportError:
+            _default_attn = "sdpa"
+        attn_implementation = override_config.get("attn_implementation", _default_attn)
         critic_model_config = AutoConfig.from_pretrained(
             local_path,
             attn_implementation=attn_implementation,
@@ -1526,7 +1543,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         self.critic_model_config = critic_model_config
 
-        fsdp_config = self.config.model.fsdp_config
+        fsdp_config = self.config.fsdp
         mixed_precision_config = fsdp_config.get("mixed_precision", None)
         if mixed_precision_config is not None:
             param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
@@ -1541,7 +1558,7 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         auto_wrap_policy = get_fsdp_wrap_policy(
             module=critic_module,
-            config=self.config.model.fsdp_config.wrap_policy,
+            config=self.config.fsdp.wrap_policy,
             is_lora=self._is_lora,
         )
 
@@ -1573,7 +1590,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
-                forward_prefetch=self.config.model.fsdp_config.forward_prefetch,
+                forward_prefetch=self.config.fsdp.forward_prefetch,
                 device_mesh=self.device_mesh,
                 cpu_offload=None,
             )

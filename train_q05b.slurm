@@ -7,7 +7,7 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=100G
-#SBATCH --partition=nvl,l40s
+#SBATCH --partition=nvl,l40s,h100
 #SBATCH --gres=gpu:1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
@@ -15,7 +15,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=n05
+#SBATCH --exclude=l03,l04
 
 set -x
 
@@ -35,7 +35,6 @@ mkdir -p logs "${CKPT_DIR}"
 # Load environment
 module reset
 module load gcc/9.3.0
-module load cuda/12.3.0
 module load anaconda3/2024.02-1
 conda activate srpo
 
@@ -61,6 +60,7 @@ export RAY_DISABLE_DOCKER_CPU_WARNING=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TOKENIZERS_PARALLELISM=false
 export WANDB_API_KEY=2404c5a258f9f0623cde0ef3041df0a8bc425bb6
+export WANDB_MODE=offline
 
 NUM_NODES=${SLURM_JOB_NUM_NODES:-2}
 GPUS_PER_NODE=1
@@ -177,6 +177,6 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         trainer.experiment_name=${EXP_NAME} \
         trainer.logger=[console,wandb] \
         trainer.val_before_train=True" \
-    2>&1 | tee "logs/${EXP_NAME}_${SLURM_JOB_ID}.log"
+    2>&1 | tee "logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
 echo "[INFO] Training finished: METHOD=${METHOD}"

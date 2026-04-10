@@ -33,9 +33,7 @@ multi_agent:
         model:
           path: ???
       n_gpus_per_node: 1
-      nnodes: 1
     - actor:
         model:
           path: ???
       n_gpus_per_node: 1
-      nnodes: 1

@@ -872,7 +872,7 @@ class RayMAPPOTrainer:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        batch_keys_to_pop = [k for k in ["input_ids", "attention_mask", "position_ids"] if k in batch.batch.keys()]
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
@@ -1242,35 +1242,27 @@ class RayMAPPOTrainer:
 
     def _extract_prompts_and_questions(self,batch: DataProto,agent_key):
         import re
-        # Step 1: 一次性 decode，避免循环里 decode
-        input_ids=batch.batch["input_ids"]
-        tokenizer=self.tokenizers[agent_key]
-        prompts=tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+        # Use raw_prompt from non_tensor_batch (new-style RLHFDataset returns message dicts,
+        # not pre-tokenized input_ids).
+        raw_prompts = batch.non_tensor_batch["raw_prompt"]  # numpy array of message-dict lists
         questions = []
-        system_prompt=""
-        # Step 2: 提取 user 和 assistant 之间的内容
-        for prompt in prompts:
-            # 尝试匹配 role 标记：user ... assistant
-            # 不区分大小写，用非贪婪 .*? 提取中间内容
-            match = re.search(r"user(.*?)assistant", prompt, flags=re.DOTALL | re.IGNORECASE)
-            if match:
-                q = match.group(1)
-            else:
-                # 如果没找到，就返回整个 prompt
-                q = prompt
-            
-            # Step 3: 清理换行符和多余空格
+        system_prompt = ""
+        for messages in raw_prompts:
+            # Extract user-turn content directly from the message list
+            q = ""
+            for msg in messages:
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    q = msg.get("content", "")
+                    break
             q = q.replace("\n", " ").strip()
-            q = re.sub(r"\s+", " ", q)  # 合并多个空格为1个
-            
+            q = re.sub(r"\s+", " ", q)
             questions.append(q)
-        # Step 3: extract system prompt from the first sample (it is a constant per batch)
-        first_prompt = prompts[0] if prompts else ""
-        match = re.search(r"system(.*?)user", first_prompt, flags=re.DOTALL | re.IGNORECASE)
-        if match:
-            system_prompt = match.group(1)
-        else:
-            system_prompt = first_prompt
+        # Extract system prompt from the first sample (constant across batch)
+        if len(raw_prompts) > 0:
+            for msg in raw_prompts[0]:
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    system_prompt = msg.get("content", "")
+                    break
         system_prompt = system_prompt.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
         system_prompt = re.sub(r"\s+", " ", system_prompt)
         return questions, system_prompt
@@ -2635,7 +2627,7 @@ class RayZOTrainer:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "dialogue_history"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
-        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        batch_keys_to_pop = [k for k in ["input_ids", "attention_mask", "position_ids"] if k in batch.batch.keys()]
 
         non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
         gen_batch = batch.pop(

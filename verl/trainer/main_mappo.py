@@ -330,10 +330,10 @@ class TaskRunner:
             tokenizers[f"model_{i}"]= hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
             processors[f"model_{i}"]= hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
             reward_fns[f"model_{i}"] = load_reward_manager(
-                config, tokenizers[f"model_{i}"], num_examine=0, **config.reward_model.get("reward_kwargs", {})
+                config, tokenizers[f"model_{i}"], **config.reward_model.get("reward_kwargs", {})
             )
             val_reward_fns[f"model_{i}"] = load_reward_manager(
-                config, tokenizers[f"model_{i}"], num_examine=1, **config.reward_model.get("reward_kwargs", {})
+                config, tokenizers[f"model_{i}"], **config.reward_model.get("reward_kwargs", {})
             )
             train_datasets[f"model_{i}"] = create_rl_dataset(config.data.train_files, config.data, tokenizers[f"model_{i}"], processors[f"model_{i}"], is_train=True)
             val_datasets[f"model_{i}"] = create_rl_dataset(config.data.val_files, config.data, tokenizers[f"model_{i}"], processors[f"model_{i}"], is_train=False)
