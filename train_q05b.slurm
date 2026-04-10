@@ -101,8 +101,29 @@ for ((i = 1; i <= worker_num; i++)); do
         bash -c "unset ROCR_VISIBLE_DEVICES; \
             ray start --address=${ip_head} \
             --num-cpus=${CPUS_PER_TASK} --num-gpus=${GPUS_PER_NODE} --block" &
+done
+
+# Poll until all NUM_NODES nodes have registered with the Ray head.
+# A fixed sleep is a race condition: the worker node needs time to load
+# its environment, run `ray start`, and complete the TCP handshake.
+echo "[INFO] Waiting for all ${NUM_NODES} Ray nodes to register..."
+for ((attempt = 1; attempt <= 24; attempt++)); do
+    ALIVE=$(python -c "
+import ray
+ray.init(address='${ip_head}', ignore_reinit_error=True)
+print(sum(1 for n in ray.nodes() if n['Alive']))
+" 2>/dev/null || echo 0)
+    if [ "${ALIVE:-0}" -ge "${NUM_NODES}" ]; then
+        echo "[INFO] All ${NUM_NODES} nodes registered after $((attempt * 5))s"
+        break
+    fi
+    echo "[INFO] ${ALIVE:-0}/${NUM_NODES} nodes registered, retrying in 5s..."
     sleep 5
 done
+if [ "${ALIVE:-0}" -lt "${NUM_NODES}" ]; then
+    echo "[ERROR] Only ${ALIVE:-0}/${NUM_NODES} nodes registered after 120s; aborting."
+    exit 1
+fi
 
 # Method-specific config
 if [ "$METHOD" = "srpo" ]; then
