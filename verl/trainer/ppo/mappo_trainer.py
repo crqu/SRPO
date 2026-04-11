@@ -696,15 +696,15 @@ class RayMAPPOTrainer:
 
                 # pad to be divisible by dp_size
                 size_divisor = (
-                    self.actor_rollout_wg.world_size
+                    self.actor_rollout_wgs[f"model_{i}"].world_size
                     if not self.async_rollout_mode
                     else self.config.actor_rollout_ref.rollout.agent.num_workers
                 )
                 test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
                 if not self.async_rollout_mode:
-                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                    test_output_gen_batch_padded = self.actor_rollout_wgs[f"model_{i}"].generate_sequences(test_gen_batch_padded)
                 else:
-                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                    test_output_gen_batch_padded = self.async_rollout_managers[f"model_{i}"].generate_sequences(test_gen_batch_padded)
 
                 # unpad
                 test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -1056,8 +1056,12 @@ class RayMAPPOTrainer:
             self.async_rollout_mode = True
             self.async_rollout_managers={}
             for i in range(num_agents):
-                self.async_rollout_managers[f"model_{i}"] = AgentLoopManager(
-                    config=self.config, worker_group=self.actor_rollout_wgs[f"model_{i}"]
+                self.async_rollout_managers[f"model_{i}"] = AgentLoopManager.create(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wgs[f"model_{i}"],
+                    rollout_resource_pool=None,
+                    reward_loop_worker_handles=None,
+                    teacher_model_manager=None,
                 )
     
     # multi-agent
