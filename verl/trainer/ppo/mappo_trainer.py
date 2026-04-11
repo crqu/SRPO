@@ -586,7 +586,7 @@ class RayMAPPOTrainer:
             for agent_idx,agent_key in enumerate(agent_keys):
                 sample_inputs = sample_inputs_lsts[r][agent_idx]
                 sample_uids = sample_uids_lsts[r][agent_idx]
-                sample_turns = []
+                sample_turns = sample_turns_lsts[r][agent_idx]
                 sample_outputs=sample_outputs_lsts[r][agent_idx]
                 sample_scores = sample_scores_lsts[r][agent_idx]
                 data_source_lst = data_source_lsts[r][agent_idx]

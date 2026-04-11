@@ -56,7 +56,8 @@ class NaiveRewardManager(RewardManagerBase):
         extra_info["num_turns"] = num_turns
         extra_info["rollout_reward_scores"] = rollout_reward_scores
 
-        response_str = await self.loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        response_str = await loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
         )
 
@@ -77,7 +78,7 @@ class NaiveRewardManager(RewardManagerBase):
                 **extra_reward_kwargs,
             )
         else:
-            result = await self.loop.run_in_executor(
+            result = await loop.run_in_executor(
                 None,
                 lambda: self.compute_score(
                     data_source=data_source,
@@ -116,7 +117,7 @@ class NaiveRewardManager(RewardManagerBase):
             tasks = [self.run_single(data[i : i + 1]) for i in range(len(data))]
             return await asyncio.gather(*tasks)
 
-        results = self.loop.run_until_complete(_run_all())
+        results = asyncio.run(_run_all())
 
         for i, result in enumerate(results):
             data_item = data[i]
