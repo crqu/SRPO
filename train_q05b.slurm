@@ -40,8 +40,8 @@ conda activate srpo
 
 cd "${REPO_DIR}"
 
-echo "[INFO] Cleaning up old Ray processes..."
-ray stop -f || true
+echo "[INFO] Cleaning up old Ray processes on all nodes..."
+srun --nodes=${SLURM_JOB_NUM_NODES} --ntasks=${SLURM_JOB_NUM_NODES} bash -c "ray stop -f" || true
 
 # Download GSM8K data if needed
 if [ ! -f "${GSM8K_TRAIN}" ]; then
@@ -160,6 +160,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
         actor_rollout_ref.rollout.max_model_len=2048 \
         actor_rollout_ref.rollout.load_format=safetensors \
+        actor_rollout_ref.model.path=${MODEL_NAME} \
         actor_rollout_ref.model.lora_rank=32 \
         actor_rollout_ref.model.lora_alpha=32 \
         actor_rollout_ref.model.target_modules=all-linear \
