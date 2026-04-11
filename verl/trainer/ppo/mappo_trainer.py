@@ -1312,9 +1312,9 @@ class RayMAPPOTrainer:
 
         batch.batch["input_ids"] = input_ids
         batch.batch["attention_mask"] = attention_mask
-        batch.non_tensor_batch.pop("raw_prompt_ids")
+        batch.non_tensor_batch.pop("raw_prompt_ids", None)
         return raw_prompts
-    
+
     def _build_input_ids_adversary(self,system_prompt,questions,batch:DataProto,agent_key,max_history_tokens):
         prompts = [
             [
@@ -1354,8 +1354,9 @@ class RayMAPPOTrainer:
 
         batch.batch["input_ids"] = input_ids
         batch.batch["attention_mask"] = attention_mask
-        batch.non_tensor_batch.pop("raw_prompt_ids")
+        batch.non_tensor_batch.pop("raw_prompt_ids", None)
         return raw_prompts
+
     def _single_agent_rollout(self,agent_idx,agent_key,batch_dict,histories,r,timing_raw,round_agent_metrics):
         # Per-agent bookkeeping and metrics
         metrics=round_agent_metrics[r][agent_idx]
@@ -1908,7 +1909,7 @@ class RayMAPPOTrainer:
                         ]
                         round_agent_batches[r][agent_idx]=batch
                     
-                    histories[:]=this_round
+                    histories[:] = [f"[Last round]: {new}" for new in this_round]
                     # histories[:] = [
                     #     old + f"\n[Round {r}]: {new}"
                     #     for old, new in zip(histories, this_round)
@@ -3408,7 +3409,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                         ]
                         round_agent_batches[r][agent_idx] = batch
 
-                    histories[:] = this_round
+                    histories[:] = [f"[Last round]: {new}" for new in this_round]
                 for r in range(num_rounds):
                     round_agent_batches[r][0].batch["token_level_scores"] = - round_agent_batches[r][1].batch["token_level_scores"]
                     round_agent_batches[r][0],kl_metrics=self._apply_kl_penalty(round_agent_batches[r][0],round_agent_batches[r][1], self.kl_ctrl_in_reward, self.config.algorithm.kl_penalty)
