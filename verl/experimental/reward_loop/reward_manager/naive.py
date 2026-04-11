@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import inspect
+from collections import defaultdict
+from typing import Any
+
+import torch
 
 from verl import DataProto
 from verl.experimental.reward_loop.reward_manager import register
@@ -97,3 +102,34 @@ class NaiveRewardManager(RewardManagerBase):
         reward = score
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
+
+    def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
+        """Synchronous batch interface expected by mappo_trainer.
+
+        Runs run_single for each item in the batch using the event loop and
+        aggregates results into the reward_tensor format.
+        """
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_extra_info: dict[str, list] = defaultdict(list)
+
+        async def _run_all():
+            tasks = [self.run_single(data[i : i + 1]) for i in range(len(data))]
+            return await asyncio.gather(*tasks)
+
+        results = self.loop.run_until_complete(_run_all())
+
+        for i, result in enumerate(results):
+            data_item = data[i]
+            prompt_length = data_item.batch["prompts"].shape[-1]
+            valid_response_length = int(data_item.batch["attention_mask"][prompt_length:].sum())
+
+            score = result["reward_score"]
+            if valid_response_length > 0:
+                reward_tensor[i, valid_response_length - 1] = score
+
+            for key, value in result.get("reward_extra_info", {}).items():
+                reward_extra_info[key].append(value)
+
+        if return_dict:
+            return {"reward_tensor": reward_tensor, "reward_extra_info": dict(reward_extra_info)}
+        return reward_tensor
