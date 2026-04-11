@@ -113,8 +113,10 @@ class RolloutReplica(ABC):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        agent_index: int = 0,
     ) -> None:
         self.replica_rank = replica_rank
+        self.agent_index = agent_index
         self.config: RolloutConfig | DiffusionRolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = model_config
 

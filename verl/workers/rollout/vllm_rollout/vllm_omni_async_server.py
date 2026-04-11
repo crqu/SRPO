@@ -251,8 +251,9 @@ class vLLMOmniReplica(vLLMReplica):
         model_config: DiffusionModelConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
+        agent_index: int = 0,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, agent_index=agent_index)
         self.server_class = ray.remote(vLLMOmniHttpServer)
 
     def _validate_launch_requirements(self) -> None:
@@ -261,4 +262,4 @@ class vLLMOmniReplica(vLLMReplica):
         pass
 
     def _get_server_name_prefix(self) -> str:
-        return "vllm_omni_"
+        return f"vllm_omni_a{self.agent_index}_"

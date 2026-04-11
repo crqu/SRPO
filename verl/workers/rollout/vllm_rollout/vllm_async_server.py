@@ -874,8 +874,9 @@ class vLLMReplica(RolloutReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
+        agent_index: int = 0,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model)
+        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, agent_index)
         self.server_class = ray.remote(vLLMHttpServer)
 
     async def launch_servers(self):
@@ -1029,4 +1030,4 @@ class vLLMReplica(RolloutReplica):
 
     def _get_server_name_prefix(self) -> str:
         """Return the Ray actor name prefix (e.g. 'vllm_' or 'vllm_omni_')."""
-        return "vllm_"
+        return f"vllm_a{self.agent_index}_"

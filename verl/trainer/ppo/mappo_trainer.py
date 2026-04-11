@@ -1062,6 +1062,7 @@ class RayMAPPOTrainer:
                     rollout_resource_pool=None,
                     reward_loop_worker_handles=None,
                     teacher_model_manager=None,
+                    agent_index=i,
                 )
     
     # multi-agent

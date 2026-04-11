@@ -1010,8 +1010,10 @@ class AgentLoopManager:
         rollout_resource_pool: RayResourcePool = None,
         teacher_model_manager: TeacherModelManager = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        agent_index: int = 0,
     ):
         self.config = config
+        self.agent_index = agent_index
         self.rollout_config, self.model_config = _get_rollout_and_model_config(config)
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
@@ -1045,9 +1047,10 @@ class AgentLoopManager:
         rollout_resource_pool: RayResourcePool = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
         teacher_model_manager: TeacherModelManager = None,
+        agent_index: int = 0,
     ):
         """Create agent loop manager."""
-        instance = cls(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
+        instance = cls(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles, agent_index)
         await instance._initialize_llm_servers()
         await instance._init_global_load_balancer()
         await instance._init_agent_loop_workers()
@@ -1072,6 +1075,7 @@ class AgentLoopManager:
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
+                agent_index=self.agent_index,
             )
             for replica_rank in range(num_replicas)
         ]
