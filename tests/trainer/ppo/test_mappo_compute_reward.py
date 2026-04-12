@@ -1,4 +1,5 @@
 """Unit tests for RayMAPPOTrainer._compute_reward."""
+import numpy as np
 import torch
 from unittest.mock import MagicMock
 from verl import DataProto
@@ -76,14 +77,11 @@ def test_extract_prompts_uses_first_prompt_for_system():
     """system_prompt must be extracted from prompts[0], not the last prompt."""
     trainer = _make_trainer()
 
-    first = "system You are helpful user What is 2+2? assistant"
-    last  = "system WRONG user What is 3+3? assistant"
-
-    tokenizer = MagicMock()
-    tokenizer.batch_decode.return_value = [first, last]
-    trainer.tokenizers = {"model_0": tokenizer}
-
-    batch = DataProto.from_dict(tensors={"input_ids": torch.zeros(2, 4, dtype=torch.long)})
+    raw_prompt = np.array([
+        [{"role": "system", "content": "You are helpful"}, {"role": "user", "content": "What is 2+2?"}],
+        [{"role": "system", "content": "WRONG"},           {"role": "user", "content": "What is 3+3?"}],
+    ], dtype=object)
+    batch = DataProto.from_dict(non_tensors={"raw_prompt": raw_prompt})
 
     _, system_prompt = trainer._extract_prompts_and_questions(batch, "model_0")
 
@@ -539,51 +537,42 @@ def test_back_propagate_reward_only_updates_last_response_token():
 # ---------------------------------------------------------------------------
 
 def test_extract_prompts_question_content():
-    """Text between 'user' and 'assistant' markers is extracted as the question."""
+    """User-turn content is extracted as the question."""
     trainer = _make_trainer()
 
-    prompt = "system You are a helpful assistant. user What is 2+2? assistant"
-    tokenizer = MagicMock()
-    tokenizer.batch_decode.return_value = [prompt]
-    trainer.tokenizers = {"model_0": tokenizer}
-
-    batch = DataProto.from_dict(tensors={"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+    raw_prompt = np.array([
+        [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "What is 2+2?"}],
+    ], dtype=object)
+    batch = DataProto.from_dict(non_tensors={"raw_prompt": raw_prompt})
     questions, _ = trainer._extract_prompts_and_questions(batch, "model_0")
 
     assert len(questions) == 1
     assert "What is 2+2?" in questions[0]
-    # Should not contain 'system' or 'assistant' markers
     assert "assistant" not in questions[0].lower()
 
 
-def test_extract_prompts_no_role_markers_returns_full_prompt():
-    """When no user/assistant markers are found, the full prompt is returned."""
+def test_extract_prompts_no_user_role_returns_empty_question():
+    """When no user-role message exists, question is empty string."""
     trainer = _make_trainer()
 
-    prompt = "This is a plain prompt with no markers."
-    tokenizer = MagicMock()
-    tokenizer.batch_decode.return_value = [prompt]
-    trainer.tokenizers = {"model_0": tokenizer}
-
-    batch = DataProto.from_dict(tensors={"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+    raw_prompt = np.array([
+        [{"role": "system", "content": "You are helpful."}],
+    ], dtype=object)
+    batch = DataProto.from_dict(non_tensors={"raw_prompt": raw_prompt})
     questions, _ = trainer._extract_prompts_and_questions(batch, "model_0")
 
-    assert questions[0] == prompt
+    assert questions[0] == ""
 
 
 def test_extract_prompts_multiple_samples():
     """Each sample gets its own extracted question."""
     trainer = _make_trainer()
 
-    prompts = [
-        "system S user Q1 assistant",
-        "system S user Q2 assistant",
-    ]
-    tokenizer = MagicMock()
-    tokenizer.batch_decode.return_value = prompts
-    trainer.tokenizers = {"model_0": tokenizer}
-
-    batch = DataProto.from_dict(tensors={"input_ids": torch.zeros(2, 4, dtype=torch.long)})
+    raw_prompt = np.array([
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "Q1"}],
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "Q2"}],
+    ], dtype=object)
+    batch = DataProto.from_dict(non_tensors={"raw_prompt": raw_prompt})
     questions, _ = trainer._extract_prompts_and_questions(batch, "model_0")
 
     assert len(questions) == 2
@@ -595,12 +584,10 @@ def test_extract_prompts_whitespace_is_normalized():
     """Newlines and multiple spaces in questions are collapsed to single spaces."""
     trainer = _make_trainer()
 
-    prompt = "system S user  What\nis\n\n2+2?  assistant"
-    tokenizer = MagicMock()
-    tokenizer.batch_decode.return_value = [prompt]
-    trainer.tokenizers = {"model_0": tokenizer}
-
-    batch = DataProto.from_dict(tensors={"input_ids": torch.zeros(1, 4, dtype=torch.long)})
+    raw_prompt = np.array([
+        [{"role": "system", "content": "S"}, {"role": "user", "content": "  What\nis\n\n2+2?  "}],
+    ], dtype=object)
+    batch = DataProto.from_dict(non_tensors={"raw_prompt": raw_prompt})
     questions, _ = trainer._extract_prompts_and_questions(batch, "model_0")
 
     assert "\n" not in questions[0]
