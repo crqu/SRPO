@@ -15,7 +15,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=l03,l04
+#SBATCH --exclude=l03,l04,n05,n06
 
 set -x
 
@@ -152,21 +152,22 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         multi_agent.agents.0.n_gpus_per_node=${GPUS_PER_NODE} \
         multi_agent.agents.1.n_gpus_per_node=${GPUS_PER_NODE} \
         actor_rollout_ref.actor.optim.lr=1e-6 \
-        actor_rollout_ref.actor.ppo_mini_batch_size=64 \
-        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
+        actor_rollout_ref.actor.ppo_mini_batch_size=256 \
+        actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
         actor_rollout_ref.rollout.name=vllm \
-        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+        actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-        actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+        actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
         actor_rollout_ref.rollout.max_model_len=2048 \
         actor_rollout_ref.rollout.load_format=safetensors \
+        actor_rollout_ref.rollout.calculate_log_probs=true \
         actor_rollout_ref.model.path=${MODEL_NAME} \
         actor_rollout_ref.model.lora_rank=32 \
         actor_rollout_ref.model.lora_alpha=32 \
         actor_rollout_ref.model.target_modules=all-linear \
         critic.model.path=${MODEL_NAME} \
         critic.optim.lr=1e-5 \
-        critic.ppo_micro_batch_size_per_gpu=4 \
+        critic.ppo_micro_batch_size_per_gpu=32 \
         algorithm.kl_ctrl.kl_coef=${KL_COEF} \
         trainer.total_training_steps=200 \
         trainer.test_freq=10 \
