@@ -1453,19 +1453,9 @@ class RayMAPPOTrainer:
 
                 reward_tensor, reward_extra_infos_dict = self._compute_reward(batch, reward_fn)
 
-            # recompute old_log_probs
-            with marked_timer("old_log_prob", timing_raw, color="blue"):
-                old_log_prob = self.actor_rollout_wgs[agent_key].compute_log_prob(batch)
-                entropys = old_log_prob.batch["entropys"]
-                response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_agg = agg_loss(
-                    loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
-                )
-                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                metrics.update(old_log_prob_metrics)
-                old_log_prob.batch.pop("entropys")
-                batch = batch.union(old_log_prob)
+            batch = self._set_old_log_probs(
+                batch, self.actor_rollout_wgs[agent_key], timing_raw, metrics
+            )
 
             if self.use_reference_policy:
                 # compute reference log_prob
@@ -1504,6 +1494,37 @@ class RayMAPPOTrainer:
         resp_texts = self.tokenizers[agent_key].batch_decode(resp_ids,skip_special_tokens=True)
         del gen_batch_output
         return resp_texts,batch
+    def _set_old_log_probs(
+        self,
+        batch: DataProto,
+        actor_rollout_wg,
+        timing_raw: dict,
+        metrics: dict,
+    ) -> DataProto:
+        """Populate batch with old_log_probs for PPO ratio computation.
+
+        Bypass path (fast): if generate_sequences already returned rollout_log_probs
+        (requires actor_rollout_ref.rollout.calculate_log_probs=true), reuse them
+        directly — avoids a full FSDP forward pass (~30s per round).
+
+        Fallback path: recompute via FSDP compute_log_prob (original behaviour).
+        """
+        if "rollout_log_probs" in batch.batch:
+            batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+            return batch
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            old_log_prob = actor_rollout_wg.compute_log_prob(batch)
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = batch.batch["response_mask"]
+            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+            entropy_agg = agg_loss(
+                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+            )
+            metrics["actor/entropy"] = entropy_agg.detach().item()
+            old_log_prob.batch.pop("entropys")
+            batch = batch.union(old_log_prob)
+        return batch
+
     def _compute_reward(self, batch: DataProto, reward_fn) -> tuple[torch.Tensor, dict]:
         """Call reward_fn synchronously and return (reward_tensor, reward_extra_infos_dict)."""
         if reward_fn is None:
@@ -1614,19 +1635,9 @@ class RayMAPPOTrainer:
 
                 reward_tensor, reward_extra_infos_dict = self._compute_reward(batch, reward_fn)
 
-            # recompute old_log_probs
-            with marked_timer("old_log_prob", agent_timing, color="blue"):
-                old_log_prob = self.actor_rollout_wgs[agent_key].compute_log_prob(batch)
-                entropys = old_log_prob.batch["entropys"]
-                response_masks = batch.batch["response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_agg = agg_loss(
-                    loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
-                )
-                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                agent_metrics.update(old_log_prob_metrics)
-                old_log_prob.batch.pop("entropys")
-                batch = batch.union(old_log_prob)
+            batch = self._set_old_log_probs(
+                batch, self.actor_rollout_wgs[agent_key], agent_timing, agent_metrics
+            )
 
             if self.use_reference_policy:
                 # compute reference log_prob
