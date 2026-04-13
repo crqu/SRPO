@@ -3470,6 +3470,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         for epoch in range(self.config.trainer.total_epochs):
             for batch_tuple in zip(*(self.train_dataloaders[k] for k in agent_keys)):
                 round_agent_batches = [[None for _ in range(num_agents)] for _ in range(num_rounds)]
+                round_agent_timings = [[{} for _ in range(num_agents)] for _ in range(num_rounds)]
                 metrics = {}
                 timing_raw = {}
                 round_agent_metrics = [[{} for _ in range(num_agents)] for _ in range(num_rounds)]
@@ -3501,16 +3502,18 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                                     batch_dict,
                                     histories,
                                     r,
-                                    timing_raw,
                                     round_agent_metrics,
                                 )
                             )
                     results = [f.result() for f in futures]
-                    for agent_idx, (resp_texts, batch) in enumerate(results):
+                    for agent_idx, (resp_texts, batch, agent_timing) in enumerate(results):
                         this_round = [
                             old + f"\nAgent {agent_idx}: {new}" for old, new in zip(this_round, resp_texts)
                         ]
                         round_agent_batches[r][agent_idx] = batch
+                        round_agent_timings[r][agent_idx] = agent_timing
+                        if "step" in agent_timing:
+                            step_durations.append(agent_timing["step"])
 
                     histories[:] = [f"[Last round]: {new}" for new in this_round]
                 # Agent 0 = adversary, Agent 1 = hero (risk-averse).
@@ -3619,24 +3622,17 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                                 )
                         results = [f.result() for f in futures]
 
+                # serial — avoids race on shared metrics dict
                 for r in range(num_rounds):
-                    futures = []
-                    from concurrent.futures import ThreadPoolExecutor
-
-                    with ThreadPoolExecutor(max_workers=num_agents) as executor:
-                        for agent_idx in range(num_agents):
-                            futures.append(
-                                executor.submit(
-                                    self._update_metrics,
-                                    r,
-                                    agent_idx,
-                                    round_agent_batches,
-                                    round_agent_metrics,
-                                    timing_raw,
-                                    metrics,
-                                )
-                            )
-                        results = [f.result() for f in futures]
+                    for agent_idx in range(num_agents):
+                        self._update_metrics(
+                            r,
+                            agent_idx,
+                            round_agent_batches,
+                            round_agent_metrics,
+                            round_agent_timings[r][agent_idx],
+                            metrics,
+                        )
 
                 if (
                     self.val_reward_fns is not None
