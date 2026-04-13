@@ -1607,15 +1607,15 @@ class RayMAPPOTrainer:
                     rewards[r][a][has_resp].to(scores.dtype)
                 )
     
-    def _update_critic(self,r,agent_idx,agent_key,round_agent_batches,timing_raw,round_agent_metrics):
-        with marked_timer("update_critic", timing_raw, color="pink"):
+    def _update_critic(self, r, agent_idx, agent_key, round_agent_batches, timing_raw, round_agent_metrics):
+        with marked_timer(f"update_critic_a{agent_idx}", timing_raw, color="pink"):
             batch=round_agent_batches[r][agent_idx]
             critic_output = self.critic_wgs[agent_key].update_critic(batch)
         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
         round_agent_metrics[r][agent_idx].update(critic_output_metrics)
 
-    def _update_actor(self,r,agent_idx,agent_key,round_agent_batches,timing_raw,round_agent_metrics):
-        with marked_timer("update_actor", timing_raw, color="red"):
+    def _update_actor(self, r, agent_idx, agent_key, round_agent_batches, timing_raw, round_agent_metrics):
+        with marked_timer(f"update_actor_a{agent_idx}", timing_raw, color="red"):
             batch=round_agent_batches[r][agent_idx]
             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
             actor_output = self.actor_rollout_wgs[agent_key].update_actor(batch)
