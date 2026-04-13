@@ -1770,10 +1770,15 @@ class RayMAPPOTrainer:
 
         return resp_texts, agent_metrics
     def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
-        assert num_agents == 2, (
-            "back_propogate_reward requires exactly 2 agents "
-            "(risk-averse at index 0, adversary at index 1)"
-        )
+        """Propagate discounted future rewards backward through rounds for all cooperative agents.
+
+        In RayMAPPOTrainer all agents share the same objective (no adversary).
+        Each agent independently accumulates its own discounted return:
+            rewards[r][a] = rewards[r][a] + gamma * rewards[r+1][a]
+
+        The last round's rewards are unchanged for all agents.
+        For the adversarial variant see RayRiskAverseTrainer.back_propogate_reward.
+        """
         # Cache scalar rewards: rewards[r][a] shape [B]
         rewards = [
             [
@@ -1784,12 +1789,11 @@ class RayMAPPOTrainer:
         ]
 
         for r in range(num_rounds - 2, -1, -1):
-            # Agent 0 (risk-averse): base reward + discounted own future reward
-            rewards[r][0] = rewards[r][0] + gamma * rewards[r + 1][0]
-            # Agent 1 (adversary): negated agent 0's next-round reward
-            rewards[r][1] = -rewards[r + 1][0]
+            for a in range(num_agents):
+                # Each agent accumulates its own discounted future return
+                rewards[r][a] = rewards[r][a] + gamma * rewards[r + 1][a]
 
-            # Write updated reward back to the last response token of each agent
+            # Write updated rewards back to the last response token of each agent
             for a in range(num_agents):
                 batch = round_agent_batches[r][a]
                 scores = batch.batch["token_level_scores"]    # [B, T]
@@ -3353,6 +3357,62 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
             system_prompt, shared_prompt, questions, histories, batch, agent_key, max_history_tokens
         )
 
+    def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
+        """Propagate rewards with adversarial back-prop.
+
+        RayRiskAverseTrainer convention: agent 0 = adversary, agent 1 = hero (risk-averse).
+
+        Hero (agent 1): accumulates discounted future return.
+            rewards[r][1] = rewards[r][1] + gamma * rewards[r+1][1]
+        Adversary (agent 0): rewarded for making the hero fail in the next round.
+            rewards[r][0] = -rewards[r+1][1]
+
+        The last round's rewards are unchanged for both agents.
+        """
+        assert num_agents == 2, (
+            "RayRiskAverseTrainer.back_propogate_reward requires exactly 2 agents "
+            "(adversary at index 0, hero/risk-averse at index 1)"
+        )
+        # Cache scalar rewards: rewards[r][a] shape [B]
+        rewards = [
+            [
+                round_agent_batches[r][a].batch["token_level_scores"].sum(-1)
+                for a in range(num_agents)
+            ]
+            for r in range(num_rounds)
+        ]
+
+        for r in range(num_rounds - 2, -1, -1):
+            # Hero (agent 1): accumulate discounted future return
+            rewards[r][1] = rewards[r][1] + gamma * rewards[r + 1][1]
+            # Adversary (agent 0): benefit from the hero failing in the next round
+            rewards[r][0] = -rewards[r + 1][1]
+
+            # Write updated rewards back to the last response token of each agent
+            for a in range(num_agents):
+                batch = round_agent_batches[r][a]
+                scores = batch.batch["token_level_scores"]    # [B, T]
+                rmask  = batch.batch["response_mask"].bool()  # [B, T]
+
+                B, T = scores.shape
+                rows = torch.arange(B, device=scores.device)
+                idx = torch.arange(T, device=scores.device).unsqueeze(0).expand(B, T)
+                last_resp_idx = (idx * rmask.long()).max(dim=1).values  # [B]
+
+                has_resp = rmask.any(dim=1)
+                n_missing = int((~has_resp).sum().item())
+                if n_missing > 0:
+                    import warnings
+                    warnings.warn(
+                        f"back_propogate_reward: {n_missing} sample(s) have no response tokens "
+                        f"in round {r}, agent {a}. Their rewards will not be updated.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                scores[rows[has_resp], last_resp_idx[has_resp]] = (
+                    rewards[r][a][has_resp].to(scores.dtype)
+                )
+
     def mappo_fit(self):
         """Run multi-agent PPO with adversarial agent and shared discussion prompts."""
         from verl.utils.tracking import Tracking
@@ -3456,9 +3516,17 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                         round_agent_batches[r][agent_idx] = batch
 
                     histories[:] = [f"[Last round]: {new}" for new in this_round]
+                # Agent 0 = adversary, Agent 1 = hero (risk-averse).
+                # back_propogate_reward (overridden in this class) applies cross-round
+                # adversarial discounting, then KL penalty constrains adversary near hero.
+                self.back_propogate_reward(num_rounds, num_agents, round_agent_batches, gamma=risk_coef)
                 for r in range(num_rounds):
-                    round_agent_batches[r][0].batch["token_level_scores"] = - round_agent_batches[r][1].batch["token_level_scores"]
-                    round_agent_batches[r][0],kl_metrics=self._apply_kl_penalty(round_agent_batches[r][0],round_agent_batches[r][1], self.kl_ctrl_in_reward, self.config.algorithm.kl_penalty)
+                    round_agent_batches[r][0], kl_metrics = self._apply_kl_penalty(
+                        round_agent_batches[r][0],
+                        round_agent_batches[r][1],
+                        self.kl_ctrl_in_reward,
+                        self.config.algorithm.kl_penalty,
+                    )
                     round_agent_metrics[r][0].update(kl_metrics)
 
                 if self.config.algorithm.use_kl_in_reward:

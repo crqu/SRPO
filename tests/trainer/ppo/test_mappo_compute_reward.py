@@ -408,10 +408,10 @@ def test_back_propagate_reward_two_rounds_round_zero_updated():
         gamma=1.0,
     )
 
-    # Agent 0 at r=0: base + γ * rewards[1][0] = [1+10, 2+20]
+    # Agent 0 at r=0: 1 + 10 = 11, 2 + 20 = 22
     assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([11.0, 22.0]))
-    # Agent 1 at r=0: -rewards[1][0] = [-10, -20]
-    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([-10.0, -20.0]))
+    # Agent 1 at r=0: 3 + 30 = 33, 4 + 40 = 44  (own return, not negated — cooperative)
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([33.0, 44.0]))
     # Final round must be unchanged
     assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
     assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
@@ -419,19 +419,19 @@ def test_back_propagate_reward_two_rounds_round_zero_updated():
 
 def test_back_propagate_reward_three_rounds_two_agents_values():
     """
-    num_rounds=3, num_agents=2, gamma=1.0 — asymmetric adversarial back-prop.
+    num_rounds=3, num_agents=2, gamma=1.0 — symmetric cooperative back-prop.
 
     Initial last-token scores:
       r=2, a=0: [10, 20]   r=1, a=0: [1, 2]   r=0, a=0: [7,  8]
       r=2, a=1: [30, 40]   r=1, a=1: [3, 4]   r=0, a=1: [9, 11]
 
     After r=1 pass:
-      rewards[1][0] = [1 + 1.0*10, 2 + 1.0*20] = [11, 22]
-      rewards[1][1] = [-10, -20]
+      rewards[1][0] = [1+10, 2+20] = [11, 22]
+      rewards[1][1] = [3+30, 4+40] = [33, 44]
 
     After r=0 pass:
-      rewards[0][0] = [7 + 1.0*11, 8 + 1.0*22] = [18, 30]
-      rewards[0][1] = [-11, -22]
+      rewards[0][0] = [7+11, 8+22] = [18, 30]
+      rewards[0][1] = [9+33, 11+44] = [42, 55]
 
     r=2 must be unchanged.
     """
@@ -451,27 +451,27 @@ def test_back_propagate_reward_three_rounds_two_agents_values():
     )
 
     assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([11.0, 22.0]))
-    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([-10.0, -20.0]))
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([33.0, 44.0]))
     assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([18.0, 30.0]))
-    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([-11.0, -22.0]))
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([42.0, 55.0]))
     # final round unchanged
     assert torch.allclose(r2a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
     assert torch.allclose(r2a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
 
 
 def test_back_propagate_reward_gamma_scaling():
-    """gamma < 1.0 scales agent 0's credit; agent 1 negation is unaffected by gamma."""
+    """gamma < 1.0 scales each agent's future reward independently (cooperative)."""
     trainer = _make_trainer()
 
     r2a0 = _make_score_batch([100.0, 100.0])
-    r2a1 = _make_score_batch([  0.0,   0.0])
+    r2a1 = _make_score_batch([200.0, 200.0])
     r1a0 = _make_score_batch([  0.0,   0.0])
     r1a1 = _make_score_batch([  0.0,   0.0])
     r0a0 = _make_score_batch([  0.0,   0.0])
     r0a1 = _make_score_batch([  0.0,   0.0])
 
-    # r=1: rewards[1][0] = 0 + 0.5*100 = 50;  rewards[1][1] = -100
-    # r=0: rewards[0][0] = 0 + 0.5*50  = 25;  rewards[0][1] = -50
+    # r=1: a0 = 0 + 0.5*100 = 50;  a1 = 0 + 0.5*200 = 100
+    # r=0: a0 = 0 + 0.5*50  = 25;  a1 = 0 + 0.5*100 = 50
     trainer.back_propogate_reward(
         num_rounds=3, num_agents=2,
         round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
@@ -479,9 +479,9 @@ def test_back_propagate_reward_gamma_scaling():
     )
 
     assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([ 50.0,  50.0]))
-    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([-100.0, -100.0]))
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([100.0, 100.0]))
     assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([ 25.0,  25.0]))
-    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([-50.0, -50.0]))
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([ 50.0,  50.0]))
 
 
 def test_back_propagate_reward_only_updates_last_response_token():
@@ -523,9 +523,9 @@ def test_back_propagate_reward_only_updates_last_response_token():
                 assert s0[b, t].item() == pytest.approx(0.0)
 
     s1 = r1a1.batch["token_level_scores"]
-    # Agent 1 at r=1: -rewards[2][0] = [-10, -20]
-    assert s1[0, 1].item() == pytest.approx(-10.0)
-    assert s1[1, 3].item() == pytest.approx(-20.0)
+    # Agent 1 at r=1 (cooperative): rewards[1][1] + rewards[2][1] = 0 + 0 = 0 (r2a1 was init to 0)
+    assert s1[0, 1].item() == pytest.approx(0.0)
+    assert s1[1, 3].item() == pytest.approx(0.0)
     for b in range(B):
         for t in range(T):
             if not r1a1.batch["response_mask"][b, t]:
