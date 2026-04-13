@@ -246,3 +246,25 @@ def test_update_actor_uses_per_agent_timing_key():
     assert not re.search(r'timing_raw\["update_actor"\]', src), (
         "_update_actor must not write to a shared 'update_actor' key"
     )
+
+
+# ---------------------------------------------------------------------------
+# C1: _apply_kl_penalty docstring must explain adversarial KL semantics
+# ---------------------------------------------------------------------------
+
+def test_apply_kl_penalty_docstring_mentions_adversary_constraint():
+    """_apply_kl_penalty docstring must state that data is the adversary constrained to data_ref (hero)."""
+    src = inspect.getsource(RayRiskAverseTrainer._apply_kl_penalty)
+    assert re.search(r"adversar", src, re.IGNORECASE), (
+        "_apply_kl_penalty docstring must explain the adversarial KL semantics: "
+        "agent 0 (adversary) is constrained to stay close to agent 1 (hero)'s policy"
+    )
+
+
+def test_risk_averse_mappo_fit_comment_identifies_agent0_as_adversary():
+    """RayRiskAverseTrainer.mappo_fit must have a comment naming agent 0 as the adversary."""
+    src = inspect.getsource(RayRiskAverseTrainer.mappo_fit)
+    assert re.search(r"agent 0.*adversar|adversar.*agent 0", src, re.IGNORECASE), (
+        "RayRiskAverseTrainer.mappo_fit must clarify that agent 0 is the adversary "
+        "(the comment added in Task 2 should satisfy this)"
+    )

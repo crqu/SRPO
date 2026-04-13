@@ -3089,20 +3089,25 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
         return ma.get("discussion_prompt", "The discussion history is as follows:")
     def _apply_kl_penalty(self, data: DataProto, data_ref: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
-        """Apply KL penalty to the token-level rewards.
+        """Apply adversarial KL penalty to constrain the adversary near the hero's policy.
 
-        This function computes the KL divergence between the reference policy and current policy,
-        then applies a penalty to the token-level rewards based on this divergence.
+        In RayRiskAverseTrainer: agent 0 = adversary, agent 1 = hero (risk-averse).
+        Call with data=adversary_batch and data_ref=hero_batch.
+
+        The KL divergence is computed between the adversary's old_log_probs and the hero's
+        old_log_probs (proxy for reference policy), penalising the adversary for deviating
+        too far from the hero's behaviour distribution.
 
         Args:
-            data (DataProto): The data containing batched model outputs and inputs.
-            kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
-            kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+            data (DataProto): Adversary (agent 0) batch — receives the KL penalty.
+            data_ref (DataProto): Hero (agent 1) batch — acts as the reference distribution.
+            kl_ctrl (core_algos.AdaptiveKLController): Adaptive KL coefficient controller.
+            kl_penalty (str): KL penalty type ("kl", "abs", "mse", "full"). Defaults to "kl".
 
         Returns:
-            tuple: A tuple containing:
-                - The updated data with token-level rewards adjusted by KL penalty
-                - A dictionary of metrics related to the KL penalty
+            tuple:
+                - data with token_level_rewards adjusted by adversarial KL penalty
+                - dict of KL metrics (penalty value and coefficient)
         """
         response_mask = data.batch["response_mask"]
         token_level_scores = data.batch["token_level_scores"]
