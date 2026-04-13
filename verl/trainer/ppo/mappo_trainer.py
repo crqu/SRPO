@@ -50,6 +50,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.checkpoint_engine import CheckpointEngineManager
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -1064,7 +1065,24 @@ class RayMAPPOTrainer:
                     teacher_model_manager=None,
                     agent_index=i,
                 )
-    
+
+            # Create one CheckpointEngineManager per agent to coordinate
+            # sleep/wake of the vLLM KV cache with FSDP training (Fix 2).
+            self.checkpoint_managers = {}
+            for i in range(num_agents):
+                agent_key = f"model_{i}"
+                checkpoint_engine_config = omega_conf_to_dataclass(
+                    self.config.actor_rollout_ref.rollout.checkpoint_engine
+                )
+                self.checkpoint_managers[agent_key] = CheckpointEngineManager(
+                    config=checkpoint_engine_config,
+                    trainer=self.actor_rollout_wgs[agent_key],
+                    replicas=self.async_rollout_managers[agent_key].rollout_replicas,
+                )
+            # Free vLLM KV cache initially so the first critic forward pass has room.
+            for agent_key in self.checkpoint_managers:
+                self.checkpoint_managers[agent_key].sleep_replicas()
+
     # multi-agent
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1387,6 +1405,8 @@ class RayMAPPOTrainer:
                     gen_batch_output = self.actor_rollout_wgs[agent_key].generate_sequences(gen_batch)
                 else:
                     gen_batch_output = self.async_rollout_managers[agent_key].generate_sequences(gen_batch)
+                    # Free vLLM KV cache so colocated FSDP workers (critic, ref) have GPU memory (Fix 3).
+                    self.checkpoint_managers[agent_key].sleep_replicas()
 
                 timing_raw.update(gen_batch_output.meta_info["timing"])
                 gen_batch_output.meta_info.pop("timing", None)
@@ -1806,6 +1826,9 @@ class RayMAPPOTrainer:
             actor_output = self.actor_rollout_wgs[agent_key].update_actor(batch)
         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
         round_agent_metrics[r][agent_idx].update(actor_output_metrics)
+        # Sync updated FSDP weights back to vLLM and restore KV cache (Fix 4).
+        if self.async_rollout_mode:
+            self.checkpoint_managers[agent_key].update_weights(self.global_steps)
 
     def _update_metrics(self,r,agent_idx,round_agent_batches,round_agent_metrics,timing_raw,metrics):
         def _with_prefix(prefix: str, metric_dict: dict) -> dict:
@@ -1845,6 +1868,11 @@ class RayMAPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+
+        # Sync checkpoint weights to vLLM and restore KV cache before any rollout (Fix 5).
+        if self.async_rollout_mode:
+            for agent_key in self.checkpoint_managers:
+                self.checkpoint_managers[agent_key].update_weights(self.global_steps)
 
         # perform validation before training
         if self.val_reward_fns is not None and self.config.trainer.get("val_before_train", True):
@@ -3348,6 +3376,11 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+
+        # Sync checkpoint weights to vLLM and restore KV cache before any rollout (Fix 5).
+        if self.async_rollout_mode:
+            for agent_key in self.checkpoint_managers:
+                self.checkpoint_managers[agent_key].update_weights(self.global_steps)
 
         # perform validation before training
         if self.val_reward_fns is not None and self.config.trainer.get("val_before_train", True):
