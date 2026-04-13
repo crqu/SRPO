@@ -177,6 +177,7 @@ class RolloutConfig(BaseConfig):
     mode: str = "async"
     nnodes: int = 0
     n_gpus_per_node: int = 8
+    agent_index: int = 0
 
     temperature: float = 1.0
     top_k: int = -1

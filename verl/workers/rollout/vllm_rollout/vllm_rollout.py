@@ -88,6 +88,8 @@ class ServerAdapter(BaseRollout):
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
 
+        self.agent_index = getattr(config, "agent_index", 0)
+
         if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
@@ -131,7 +133,7 @@ class ServerAdapter(BaseRollout):
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            self.server_handle = ray.get_actor(f"vllm_a{self.agent_index}_server_{self.replica_rank}_{self.node_rank}")
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future
