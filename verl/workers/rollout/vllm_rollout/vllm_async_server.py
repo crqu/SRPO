@@ -225,7 +225,7 @@ class vLLMHttpServer:
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
-        compilation_config.setdefault("cudagraph_mode", "FULL_AND_PIECEWISE")
+        compilation_config.setdefault("cudagraph_mode", "PIECEWISE")
 
         # FULL cuda graph is not yet supported with DCP, downgrade to PIECEWISE
         dcp_size = engine_kwargs.get("decode_context_parallel_size", 1) or 1
@@ -234,6 +234,17 @@ class vLLMHttpServer:
                 "FULL cuda graph is not supported with DCP (decode_context_parallel_size=%d), "
                 "downgrading cudagraph_mode to PIECEWISE.",
                 dcp_size,
+            )
+            compilation_config["cudagraph_mode"] = "PIECEWISE"
+
+        # FULL cuda graph is incompatible with dynamic LoRA (causes CUDA error: invalid argument
+        # in punica_base._update_base_metadata during the first sampling rollout after CUDA graph
+        # capture, because the graph captures LoRA index tensors as fixed values that diverge from
+        # the runtime token→slot mapping).  Downgrade to PIECEWISE whenever LoRA is in use.
+        if self.lora_as_adapter and compilation_config["cudagraph_mode"] == "FULL_AND_PIECEWISE":
+            logger.warning(
+                "FULL cuda graph is incompatible with dynamic LoRA, "
+                "downgrading cudagraph_mode to PIECEWISE."
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
 
