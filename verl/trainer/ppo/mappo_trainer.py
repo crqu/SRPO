@@ -1909,10 +1909,11 @@ class RayMAPPOTrainer:
 
         for epoch in range(self.config.trainer.total_epochs):
             for batch_tuple in zip(*(self.train_dataloaders[k] for k in agent_keys)):
-                round_agent_batches=[[None for _ in range(num_agents)] for _ in range(num_rounds)]
+                round_agent_batches = [[None for _ in range(num_agents)] for _ in range(num_rounds)]
+                round_agent_timings = [[{} for _ in range(num_agents)] for _ in range(num_rounds)]
                 metrics = {}
                 timing_raw = {}
-                round_agent_metrics=[[{} for _ in range(num_agents)] for _ in range(num_rounds)]
+                round_agent_metrics = [[{} for _ in range(num_agents)] for _ in range(num_rounds)]
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1930,10 +1931,10 @@ class RayMAPPOTrainer:
                 for r in range(num_rounds):
                     this_round = [""] * batch_size
                     from concurrent.futures import ThreadPoolExecutor
-                    futures=[]
+                    futures = []
                     with ThreadPoolExecutor(max_workers=num_agents) as executor:
-                        for agent_idx,agent_key in enumerate(agent_keys):
-                            batch_dict=batch_tuple[agent_idx]
+                        for agent_idx, agent_key in enumerate(agent_keys):
+                            batch_dict = batch_tuple[agent_idx]
                             futures.append(
                                 executor.submit(
                                     self._single_agent_rollout,
@@ -1942,17 +1943,19 @@ class RayMAPPOTrainer:
                                     batch_dict,
                                     histories,
                                     r,
-                                    timing_raw,
-                                    round_agent_metrics
+                                    round_agent_metrics,
                                 )
-                            )               
+                            )
                     results = [f.result() for f in futures]
-                    for agent_idx, (resp_texts, batch) in enumerate(results):
+                    for agent_idx, (resp_texts, batch, agent_timing) in enumerate(results):
                         this_round = [
                             old + f"\nAgent {agent_idx}: {new}"
                             for old, new in zip(this_round, resp_texts)
                         ]
-                        round_agent_batches[r][agent_idx]=batch
+                        round_agent_batches[r][agent_idx] = batch
+                        round_agent_timings[r][agent_idx] = agent_timing
+                        if "step" in agent_timing:
+                            step_durations.append(agent_timing["step"])
                     
                     histories[:] = [f"[Last round]: {new}" for new in this_round]
                     # histories[:] = [
@@ -1966,28 +1969,22 @@ class RayMAPPOTrainer:
                 # backpropagate reward
                 self.back_propogate_reward(num_rounds,num_agents,round_agent_batches,gamma=1)
                 
-                # apply kl in reward
+                # Apply KL penalty serially — kl_ctrl.update() is not thread-safe
                 if self.config.algorithm.use_kl_in_reward:
                     for r in range(num_rounds):
-                        futures=[]
-                        with ThreadPoolExecutor(max_workers=num_agents) as executor:
-                            for agent_idx in range(num_agents):
-                                batch=round_agent_batches[r][agent_idx]
-                                futures.append(
-                                    executor.submit(
-                                        apply_kl_penalty,
-                                        batch,
-                                        self.kl_ctrl_in_reward,
-                                        self.config.algorithm.kl_penalty
-                                    )
-                                )
-                        results = [f.result() for f in futures]
-                        for agent_idx,(batch,kl_metrics) in enumerate(results):
+                        for agent_idx in range(num_agents):
+                            batch = round_agent_batches[r][agent_idx]
+                            batch, kl_metrics = apply_kl_penalty(
+                                batch,
+                                self.kl_ctrl_in_reward,
+                                self.config.algorithm.kl_penalty,
+                            )
+                            round_agent_batches[r][agent_idx] = batch
                             round_agent_metrics[r][agent_idx].update(kl_metrics)
                 else:
                     for r in range(num_rounds):
                         for agent_idx in range(num_agents):
-                            batch=round_agent_batches[r][agent_idx]
+                            batch = round_agent_batches[r][agent_idx]
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
                 # compute advantages, executed on the driver process
                 norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
@@ -2062,7 +2059,7 @@ class RayMAPPOTrainer:
                             agent_idx,
                             round_agent_batches,
                             round_agent_metrics,
-                            timing_raw,
+                            round_agent_timings[r][agent_idx],
                             metrics,
                         )
                 # validate
