@@ -1246,12 +1246,12 @@ class RayMAPPOTrainer:
             if self.use_rm:
                 self.rm_wg.stop_profile()
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", agent_key="model_0"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wgs["model_0"].world_size
+        world_size = self.actor_rollout_wgs[agent_key].world_size
         global_partition_lst = get_seqlen_balanced_partitions(
             global_seqlen_lst, k_partitions=world_size, equal_size=True
         )
@@ -1375,7 +1375,7 @@ class RayMAPPOTrainer:
         batch.non_tensor_batch.pop("raw_prompt_ids", None)
         return raw_prompts
 
-    def _single_agent_rollout(self,agent_idx,agent_key,batch_dict,histories,r,timing_raw,round_agent_metrics):
+    def _single_agent_rollout(self, agent_idx, agent_key, batch_dict, histories, r, round_agent_metrics):
         # Per-agent bookkeeping and metrics
         metrics=round_agent_metrics[r][agent_idx]
         batch: DataProto = DataProto.from_single_dict(batch_dict)
@@ -1398,9 +1398,10 @@ class RayMAPPOTrainer:
         gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
         reward_extra_infos_dict: dict = {}
-        with marked_timer("step", timing_raw):
+        agent_timing: dict = {}
+        with marked_timer("step", agent_timing):
             # generate a batch
-            with marked_timer("gen", timing_raw, color="red"):
+            with marked_timer("gen", agent_timing, color="red"):
                 if not self.async_rollout_mode:
                     gen_batch_output = self.actor_rollout_wgs[agent_key].generate_sequences(gen_batch)
                 else:
@@ -1408,7 +1409,7 @@ class RayMAPPOTrainer:
                     # Free vLLM KV cache so colocated FSDP workers (critic, ref) have GPU memory (Fix 3).
                     self.checkpoint_managers[agent_key].sleep_replicas()
 
-                timing_raw.update(gen_batch_output.meta_info["timing"])
+                agent_timing.update(gen_batch_output.meta_info["timing"])
                 gen_batch_output.meta_info.pop("timing", None)
 
             # TODO: figure out the meaning of this step (calculate adv)
@@ -1420,8 +1421,8 @@ class RayMAPPOTrainer:
                     reward_fn = self.reward_fn
                 if reward_fn is None:
                     raise ValueError("A reward_fn is required for REMAX advantage estimation in MAPPO.")
-            
-                with marked_timer("gen_max", timing_raw, color="purple"):
+
+                with marked_timer("gen_max", agent_timing, color="purple"):
                     gen_baseline_batch = deepcopy(gen_batch)
                     gen_baseline_batch.meta_info["do_sample"] = False
                     if not self.async_rollout_mode:
@@ -1455,12 +1456,13 @@ class RayMAPPOTrainer:
                     batch,
                     metrics=metrics,
                     logging_prefix=f"global_seqlen_agent{agent_idx}",
+                    agent_key=agent_key,
                 )
 
             # compute global_valid tokens
             batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
-            with marked_timer("reward", timing_raw, color="yellow"):
+            with marked_timer("reward", agent_timing, color="yellow"):
                 if self.use_rm and "rm_scores" not in batch.batch.keys():
                     reward_tensor = self.rm_wg.compute_rm_score(batch)
                     batch = batch.union(reward_tensor)
@@ -1474,12 +1476,12 @@ class RayMAPPOTrainer:
                 reward_tensor, reward_extra_infos_dict = self._compute_reward(batch, reward_fn)
 
             batch = self._set_old_log_probs(
-                batch, self.actor_rollout_wgs[agent_key], timing_raw, metrics
+                batch, self.actor_rollout_wgs[agent_key], agent_timing, metrics
             )
 
             if self.use_reference_policy:
                 # compute reference log_prob
-                with marked_timer("ref", timing_raw, color="olive"):
+                with marked_timer("ref", agent_timing, color="olive"):
                     if not self.ref_in_actor:
                         ref_log_prob = self.ref_policy_wgs[agent_key].compute_ref_log_prob(batch)
                     else:
@@ -1488,11 +1490,11 @@ class RayMAPPOTrainer:
 
             # compute values
             if self.use_critic:
-                with marked_timer("values", timing_raw, color="cyan"):
+                with marked_timer("values", agent_timing, color="cyan"):
                     values = self.critic_wgs[agent_key].compute_values(batch)
-                    batch = batch.union(values)          
+                    batch = batch.union(values)
 
-            with marked_timer("adv", timing_raw, color="brown"):
+            with marked_timer("adv", agent_timing, color="brown"):
                 # we combine with rule-based rm
                 reward_extra_infos_dict = reward_extra_infos_dict or {}
                 batch.batch["token_level_scores"] = reward_tensor
@@ -1511,9 +1513,9 @@ class RayMAPPOTrainer:
                 #     batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
         # update round history
         resp_ids = batch.batch["responses"]
-        resp_texts = self.tokenizers[agent_key].batch_decode(resp_ids,skip_special_tokens=True)
+        resp_texts = self.tokenizers[agent_key].batch_decode(resp_ids, skip_special_tokens=True)
         del gen_batch_output
-        return resp_texts,batch
+        return resp_texts, batch, agent_timing
     def _set_old_log_probs(
         self,
         batch: DataProto,

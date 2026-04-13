@@ -211,7 +211,6 @@ def test_single_agent_rollout_calls_sleep_replicas_after_generate_async():
         batch_dict=batch_dict,
         histories=None,
         r=0,
-        timing_raw={},
         round_agent_metrics={0: {0: {}}},
     )
 
@@ -251,7 +250,6 @@ def test_single_agent_rollout_calls_sleep_replicas_after_generate_async():
         batch_dict=batch_dict2,
         histories=None,
         r=0,
-        timing_raw={},
         round_agent_metrics={0: {0: {}}},
     )
 
@@ -279,7 +277,6 @@ def test_single_agent_rollout_no_sleep_replicas_in_sync_mode():
         batch_dict=batch_dict,
         histories=None,
         r=0,
-        timing_raw={},
         round_agent_metrics={0: {0: {}}},
     )
 
