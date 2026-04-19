@@ -402,8 +402,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # override model kwargs
         try:
             import flash_attn  # noqa: F401
+            import torch
 
-            _default_attn = "flash_attention_2"
+            _default_attn = "flash_attention_2" if torch.cuda.is_available() else "sdpa"
         except ImportError:
             _default_attn = "sdpa"
         attn_implementation = override_model_config.get("attn_implementation", _default_attn)
@@ -1442,8 +1443,9 @@ class CriticWorker(Worker, DistProfilerExtension):
         # override model kwargs
         try:
             import flash_attn  # noqa: F401
+            import torch
 
-            _default_attn = "flash_attention_2"
+            _default_attn = "flash_attention_2" if torch.cuda.is_available() else "sdpa"
         except ImportError:
             _default_attn = "sdpa"
         attn_implementation = override_config.get("attn_implementation", _default_attn)
