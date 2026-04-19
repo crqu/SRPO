@@ -165,6 +165,7 @@ class TaskRunner:
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
         from verl.trainer.ppo.ray_trainer import Role
+        from verl.trainer.ppo.utils import need_critic, need_reference_policy
 
         # read multi-agent config
         ma = OmegaConf.select(config, "multi_agent") or {}
@@ -176,49 +177,45 @@ class TaskRunner:
                 "Please provide multi_agent.agents list (length == num_agents) with per-agent resource/model entries."
             )
 
-        # global_pool_id = "global_pool"
-        resource_pool_spec ={}
-        # resource_pool_spec = {
-        #     global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
-        # }
-        # TODO Here you can use the new registration method to support dynamic registration of roles
+        resource_pool_spec = {}
+        colocate_count_dict = {}
+
         if config.reward_model.enable_resource_pool:
             if config.reward_model.n_gpus_per_node <= 0:
                 raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
             if config.reward_model.nnodes <= 0:
                 raise ValueError("config.reward_model.nnodes must be greater than 0")
-
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
+            colocate_count_dict["reward_pool"] = 1  # only RewardModelWorker
 
-        
-        # one pool per agent
+        # Divide the cluster's total nodes equally among agents.
+        # nnodes is always global (config.trainer.nnodes); per-agent n_gpus_per_node may differ.
+        nodes_per_agent = config.trainer.nnodes // num_agents
+        if nodes_per_agent <= 0:
+            raise ValueError(
+                f"nodes_per_agent must be >=1; got trainer.nnodes={config.trainer.nnodes} "
+                f"with num_agents={num_agents}. Increase trainer.nnodes or reduce num_agents."
+            )
+
+        # Compute actual co-location count: actor_rollout always, plus critic and ref if enabled.
+        colocate_per_agent = 1 + int(need_critic(config)) + int(need_reference_policy(config))
+
         for i in range(num_agents):
             a = agents_cfg[i]
-            total_n_gpus = int(a.get("n_gpus_per_node", config.trainer.n_gpus_per_node))
-            nnodes = int(a.get("nnodes", config.trainer.nnodes))
-            nodes_per_agent = nnodes // num_agents
-            n_gpus = total_n_gpus
-            if nodes_per_agent <= 0:
-                raise ValueError(
-                    f"nodes_per_agent must be >=1; got nnodes={nnodes} with num_agents={num_agents}. "
-                    f"Increase nnodes or reduce num_agents."
-                )
-            # add actor mapping
+            n_gpus = int(a.get("n_gpus_per_node", config.trainer.n_gpus_per_node))
             resource_pool_spec[f"agent_pool_{i}"] = [n_gpus] * nodes_per_agent
+            colocate_count_dict[f"agent_pool_{i}"] = colocate_per_agent
             self.mapping[f"agent_pool_{i}"] = f"agent_pool_{i}"
-            # self.mapping[f"agent_pool_{i}"] = global_pool_id
-            # add critic mapping
-            # resource_pool_spec[f"critic_pool_{i}"] = [n_gpus] * nnodes
-            # self.mapping[f"critic_pool_{i}"] = f"critic_pool_{i}"
             self.mapping[f"critic_pool_{i}"] = f"agent_pool_{i}"
-            # self.mapping[f"critic_pool_{i}"] = global_pool_id
-        
-        # self.mapping[Role.ActorRollout] = global_pool_id
-        # self.mapping[Role.Critic] = global_pool_id
+
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec,
+            mapping=self.mapping,
+            colocate_count_dict=colocate_count_dict,
+        )
         return resource_pool_manager
 
     def add_reward_model_worker(self, config):

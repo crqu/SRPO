@@ -268,3 +268,50 @@ def test_risk_averse_mappo_fit_comment_identifies_agent0_as_adversary():
         "RayRiskAverseTrainer.mappo_fit must clarify that agent 0 is the adversary "
         "(the comment added in Task 2 should satisfy this)"
     )
+
+
+# ---------------------------------------------------------------------------
+# Resource allocation fixes: colocate_count_dict + global nnodes
+# ---------------------------------------------------------------------------
+import dataclasses
+from verl.single_controller.ray import ResourcePoolManager
+from verl.trainer.main_mappo import TaskRunner
+
+
+def test_resource_pool_manager_has_colocate_count_dict_field():
+    """ResourcePoolManager must declare colocate_count_dict as a dataclass field."""
+    fields = {f.name for f in dataclasses.fields(ResourcePoolManager)}
+    assert "colocate_count_dict" in fields, (
+        "ResourcePoolManager must have a colocate_count_dict field "
+        "so callers can set per-pool max_colocate_count"
+    )
+
+
+def test_create_resource_pool_reads_colocate_count_dict():
+    """create_resource_pool must read from colocate_count_dict, not hardcode 3."""
+    src = inspect.getsource(ResourcePoolManager.create_resource_pool)
+    assert "colocate_count_dict" in src, (
+        "create_resource_pool must look up max_colocate_count from self.colocate_count_dict"
+    )
+    assert "max_colocate_count=3" not in src, (
+        "create_resource_pool must not hardcode max_colocate_count=3"
+    )
+
+
+def test_init_resource_pool_mgr_uses_global_nnodes():
+    """init_resource_pool_mgr must use config.trainer.nnodes, not per-agent nnodes."""
+    src = inspect.getsource(TaskRunner.init_resource_pool_mgr)
+    assert "config.trainer.nnodes" in src, (
+        "nodes_per_agent must be derived from config.trainer.nnodes (global)"
+    )
+    assert not re.search(r'a\.get\s*\(\s*["\']nnodes["\']', src), (
+        "init_resource_pool_mgr must not read per-agent 'nnodes' — nnodes is always global"
+    )
+
+
+def test_init_resource_pool_mgr_passes_colocate_count_dict():
+    """init_resource_pool_mgr must build and pass colocate_count_dict to ResourcePoolManager."""
+    src = inspect.getsource(TaskRunner.init_resource_pool_mgr)
+    assert "colocate_count_dict" in src, (
+        "init_resource_pool_mgr must compute colocate_count_dict and pass it to ResourcePoolManager"
+    )

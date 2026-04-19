@@ -187,22 +187,27 @@ class ResourcePoolManager:
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[int, str]
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    # Per-pool co-location counts: how many WorkerGroups share one GPU slot.
+    # Falls back to 3 for pools not listed (backward-compatible with single-agent PPO).
+    colocate_count_dict: dict[str, int] = field(default_factory=dict)
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
 
         Initializes resource pools based on the resource pool specification,
         with each pool managing GPU resources across multiple nodes.
-        For FSDP backend, uses max_colocate_count=1 to merge WorkerGroups.
-        For Megatron backend, uses max_colocate_count>1 for different models.
+        max_colocate_count is read from colocate_count_dict for each pool
+        (fallback: 3, which matches the single-agent actor+critic+ref layout).
         """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
+            # max_colocate_count = number of WorkerGroups co-located per GPU slot.
+            # Callers should pass colocate_count_dict to match actual worker count.
+            max_colocate_count = self.colocate_count_dict.get(resource_pool_name, 3)
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes,
+                use_gpu=True,
+                max_colocate_count=max_colocate_count,
+                name_prefix=resource_pool_name,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
