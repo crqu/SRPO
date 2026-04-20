@@ -225,11 +225,10 @@ class vLLMHttpServer:
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
             compilation_config = json.loads(compilation_config)
-        compilation_config.setdefault("cudagraph_mode", "PIECEWISE")
 
         # FULL cuda graph is not yet supported with DCP, downgrade to PIECEWISE
         dcp_size = engine_kwargs.get("decode_context_parallel_size", 1) or 1
-        if dcp_size > 1 and compilation_config["cudagraph_mode"] == "FULL_AND_PIECEWISE":
+        if dcp_size > 1 and compilation_config.get("cudagraph_mode") == "FULL_AND_PIECEWISE":
             logger.warning(
                 "FULL cuda graph is not supported with DCP (decode_context_parallel_size=%d), "
                 "downgrading cudagraph_mode to PIECEWISE.",
@@ -237,16 +236,25 @@ class vLLMHttpServer:
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
 
-        # FULL cuda graph is incompatible with dynamic LoRA (causes CUDA error: invalid argument
-        # in punica_base._update_base_metadata during the first sampling rollout after CUDA graph
-        # capture, because the graph captures LoRA index tensors as fixed values that diverge from
-        # the runtime token→slot mapping).  Downgrade to PIECEWISE whenever LoRA is in use.
-        if self.lora_as_adapter and compilation_config["cudagraph_mode"] == "FULL_AND_PIECEWISE":
-            logger.warning(
-                "FULL cuda graph is incompatible with dynamic LoRA, "
-                "downgrading cudagraph_mode to PIECEWISE."
-            )
-            compilation_config["cudagraph_mode"] = "PIECEWISE"
+        # PIECEWISE (and FULL) CUDA graph capture uses LORA_WARMUP_RANK=8 (hardcoded in vllm) for
+        # dummy LoRA warm-up, baking rank-8 kernel launch params into the captured graph. When the
+        # actual LoRA (e.g. rank 32) is used at inference time, the replayed graph launches the
+        # rank-8 punica triton kernel against rank-32 weights, yielding an async
+        # "CUDA error: invalid argument" that surfaces at the next synchronizing copy in
+        # punica_base._update_base_metadata. Disable CUDA graphs entirely when LoRA-as-adapter is
+        # active; torch.compile Inductor kernel fusion still applies for linear-layer speedups.
+        if self.lora_as_adapter:
+            if "cudagraph_mode" not in compilation_config:
+                compilation_config["cudagraph_mode"] = "NONE"
+            elif compilation_config["cudagraph_mode"] != "NONE":
+                logger.warning(
+                    "CUDA graph mode '%s' is incompatible with LoRA-as-adapter (warmup rank mismatch). "
+                    "Forcing cudagraph_mode=NONE.",
+                    compilation_config["cudagraph_mode"],
+                )
+                compilation_config["cudagraph_mode"] = "NONE"
+        else:
+            compilation_config.setdefault("cudagraph_mode", "PIECEWISE")
 
         compilation_config = json.dumps(compilation_config)
         args = {
