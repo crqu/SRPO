@@ -90,7 +90,16 @@ class ServerAdapter(BaseRollout):
 
         self.agent_index = getattr(config, "agent_index", 0)
 
-        if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
+        lora_as_adapter = (
+            model_config.lora_rank > 0 or model_config.lora.get("rank", 0) > 0
+        ) and not model_config.lora.get("merge", False)
+
+        if lora_as_adapter:
+            # sleep(level=2) frees ALL CUDA memory, invalidating lora_a_stacked/lora_b_stacked
+            # buffers (not registered as named_buffers, not restored on wake_up).
+            # level=1 only frees KV cache, keeping model weight tensors valid.
+            self.sleep_level = 1
+        elif config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
             self.sleep_level = 1
         else:
