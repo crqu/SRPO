@@ -241,8 +241,14 @@ class vLLMHttpServer:
         # actual LoRA (e.g. rank 32) is used at inference time, the replayed graph launches the
         # rank-8 punica triton kernel against rank-32 weights, yielding an async
         # "CUDA error: invalid argument" that surfaces at the next synchronizing copy in
-        # punica_base._update_base_metadata. Disable CUDA graphs entirely when LoRA-as-adapter is
-        # active; torch.compile Inductor kernel fusion still applies for linear-layer speedups.
+        # punica_base._update_base_metadata.
+        #
+        # Two independent CUDA graph mechanisms must BOTH be disabled:
+        #   1. vLLM's own graph capture: controlled by cudagraph_mode (set to NONE below)
+        #   2. torch.compile/Inductor's internal triton.cudagraphs: controlled by enforce_eager;
+        #      even with cudagraph_mode=NONE, enforce_eager=False activates Inductor which has its
+        #      own graph capture that also bakes the rank-8 warmup params.
+        # Force enforce_eager=True to disable both paths when LoRA-as-adapter is active.
         if self.lora_as_adapter:
             if "cudagraph_mode" not in compilation_config:
                 compilation_config["cudagraph_mode"] = "NONE"
@@ -271,7 +277,7 @@ class vLLMHttpServer:
             "enable_prefix_caching": self.config.enable_prefix_caching,
             "enable_sleep_mode": self.config.enable_sleep_mode,
             "logprobs_mode": self.config.logprobs_mode,
-            "enforce_eager": self.config.enforce_eager,
+            "enforce_eager": True if self.lora_as_adapter else self.config.enforce_eager,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
