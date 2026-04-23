@@ -887,6 +887,11 @@ class vLLMHttpServer:
             sleep_level = 1
         else:
             sleep_level = 2
+        # collective_rpc("sleep") discards KV cache blocks from GPU memory without
+        # clearing the prefix cache (unlike engine.sleep() which calls reset_prefix_cache
+        # first). Stale prefix cache entries pointing to freed GPU memory cause CUDA
+        # "invalid argument" errors on the next inference call. Reset explicitly here.
+        await self.engine.reset_prefix_cache()
         await self.engine.collective_rpc("sleep", kwargs={"level": sleep_level})
 
         # clear encoder cache: https://github.com/vllm-project/vllm/pull/33452

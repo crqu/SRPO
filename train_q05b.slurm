@@ -15,7 +15,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=l03,l04,n05,n06
+#SBATCH --exclude=l07,l08
 
 set -x
 
@@ -61,6 +61,12 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TOKENIZERS_PARALLELISM=false
 export WANDB_API_KEY=2404c5a258f9f0623cde0ef3041df0a8bc425bb6
 export WANDB_MODE=offline
+# Prevent Ray from setting CUDA_VISIBLE_DEVICES="" for zero-GPU processes (driver,
+# TaskRunner). Without this, Ray's current behavior hides the GPU from the head
+# node's processes, which then propagates to WorkerDict actors on the same node
+# causing "Flash Attention 2 not available on CPU" errors for agent_pool_1.
+export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+export CUDA_LAUNCH_BLOCKING=1
 
 NUM_NODES=${SLURM_JOB_NUM_NODES:-2}
 GPUS_PER_NODE=1
