@@ -122,6 +122,8 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        # Tracks whether the engine is sleeping to guard generate() calls.
+        self._is_sleeping = False
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -471,6 +473,9 @@ class vLLMHttpServer:
         priority: int = 0,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
+        if self._is_sleeping:
+            raise RuntimeError("vLLM engine is sleeping; cannot generate. Call wake_up() first.")
+
         prompt_ids = normalize_token_ids(prompt_ids)
 
         # Calculate the maximum possible new tokens based on available context space
@@ -590,6 +595,7 @@ class vLLMHttpServer:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
             await self.engine.reset_prefix_cache()
+            self._is_sleeping = False
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
@@ -600,6 +606,7 @@ class vLLMHttpServer:
         if self.rollout_mode == RolloutMode.HYBRID:
             await self._sleep_hybrid()
         elif self.rollout_mode == RolloutMode.COLOCATED:
+            self._is_sleeping = True
             await self.engine.sleep(level=1)
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
@@ -627,6 +634,10 @@ class vLLMHttpServer:
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
+
+    async def mark_awake(self):
+        """Clear the sleeping flag after the engine is woken via collective_rpc (naive backend)."""
+        self._is_sleeping = False
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()

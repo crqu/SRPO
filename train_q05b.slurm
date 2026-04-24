@@ -7,7 +7,7 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=100G
-#SBATCH --partition=nvl,l40s,h100
+#SBATCH --partition=nvl,l40s,h100,a100
 #SBATCH --gres=gpu:1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
@@ -15,7 +15,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=l07,l08
+#SBATCH --exclude=l07,l08,l03,l05,n01,n06
 
 set -x
 
@@ -67,6 +67,11 @@ export WANDB_MODE=offline
 # causing "Flash Attention 2 not available on CPU" errors for agent_pool_1.
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export CUDA_LAUNCH_BLOCKING=1
+export HYDRA_FULL_ERROR=1
+export RAY_DEDUP_LOGS=0
+export RAY_BACKEND_LOG_LEVEL=debug
+export VLLM_LOGGING_LEVEL=DEBUG
+nvidia-smi
 
 NUM_NODES=${SLURM_JOB_NUM_NODES:-2}
 GPUS_PER_NODE=1
@@ -142,6 +147,26 @@ else
     EXP_NAME="ippo_q05b"
 fi
 
+# Debug info
+echo "[DEBUG] hostname=$(hostname)"
+echo "[DEBUG] pwd=$(pwd)"
+echo "[DEBUG] which python=$(which python)"
+echo "[DEBUG] python version=$(python -V 2>&1)"
+echo "[DEBUG] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+echo "[DEBUG] NCCL_DEBUG=${NCCL_DEBUG}"
+echo "[DEBUG] VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL}"
+echo "[DEBUG] HYDRA_FULL_ERROR=${HYDRA_FULL_ERROR}"
+nvidia-smi
+python - <<'PY'
+import torch, vllm, ray
+print("[DEBUG] torch", torch.__version__)
+print("[DEBUG] cuda available", torch.cuda.is_available())
+print("[DEBUG] device count", torch.cuda.device_count())
+print("[DEBUG] vllm", vllm.__version__)
+print("[DEBUG] ray", ray.__version__)
+PY
+
+
 # Launch training
 PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
     bash -c "unset ROCR_VISIBLE_DEVICES; \
@@ -165,8 +190,11 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
         actor_rollout_ref.rollout.max_model_len=2048 \
+        actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
         actor_rollout_ref.rollout.load_format=safetensors \
         actor_rollout_ref.rollout.calculate_log_probs=true \
+        actor_rollout_ref.rollout.enforce_eager=true \
+        +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=NONE \
         actor_rollout_ref.model.path=${MODEL_NAME} \
         actor_rollout_ref.model.lora_rank=32 \
         actor_rollout_ref.model.lora_alpha=32 \

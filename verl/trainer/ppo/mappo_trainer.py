@@ -1719,6 +1719,11 @@ class RayMAPPOTrainer:
                 histories=[""]*batch_size
                 # rollout
                 for r in range(num_rounds):
+                    # Engines were put to sleep after each round's generate. Wake them
+                    # before rounds 1+ so generate() doesn't hit the sleeping guard.
+                    if r > 0 and self.async_rollout_mode:
+                        for agent_key in agent_keys:
+                            self.checkpoint_managers[agent_key].wake_up_replicas()
                     this_round = [""] * batch_size
                     from concurrent.futures import ThreadPoolExecutor
                     futures = []
