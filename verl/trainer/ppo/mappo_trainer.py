@@ -2126,6 +2126,9 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                 batch_size = self.config.data.train_batch_size
                 histories = [""] * batch_size
                 for r in range(num_rounds):
+                    if r > 0 and self.async_rollout_mode:
+                        for agent_key in agent_keys:
+                            self.checkpoint_managers[agent_key].wake_up_replicas()
                     this_round = [""] * batch_size
                     from concurrent.futures import ThreadPoolExecutor
 
