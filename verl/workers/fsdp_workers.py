@@ -619,6 +619,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
+            # When world_size=1, FSDP uses NO_SHARD and checks that params are on GPU
+            # before sync_module_states broadcasting — the device_id migration doesn't
+            # run early enough in that path. Move rank-0 model to GPU explicitly.
+            if self.rank == 0:
+                actor_module = actor_module.to(get_device_id())
             actor_module_fsdp = FSDP(
                 actor_module,
                 cpu_offload=cpu_offload,
@@ -1583,6 +1588,8 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         if config.strategy == "fsdp":
+            if self.rank == 0:
+                critic_module = critic_module.to(get_device_id())
             critic_module = FSDP(
                 critic_module,
                 param_init_fn=init_fn,
