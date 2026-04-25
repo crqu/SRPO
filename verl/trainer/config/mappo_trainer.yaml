@@ -25,6 +25,12 @@ multi_agent:
   # Prompt prepended to discussion history for each agent turn.
   discussion_prompt: "The discussion history is as follows:"
 
+  # SRPO-only: apply (1/tau) * KL(pi_adv || pi_hero) regularizer to the
+  # adversary's token-level reward, evaluated on adversary trajectories with
+  # the hero policy's logprobs. Only consulted by RayRiskAverseTrainer; tau is
+  # the reciprocal of algorithm.kl_ctrl.kl_coef.
+  adversary_kl_to_hero: false
+
   # Per-agent resource and model overrides.
   # Length must equal num_agents. Each entry can override actor.model.path,
   # n_gpus_per_node, nnodes, and any actor/critic sub-config.

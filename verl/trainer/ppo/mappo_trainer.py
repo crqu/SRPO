@@ -638,153 +638,7 @@ class RayMAPPOTrainer:
             save_validation_csv(rollout_records)
 
         return metric_dict
-    def _validate(self):
-        metric_dict = {}
-        ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
-        num_agents = int(ma.get("num_agents", 1))
-        num_rounds = int(ma.get("num_rounds", 1))
-        for i in range(num_agents):
-            data_source_lst = []
-            reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
-            # Lists to collect samples for the table
-            sample_inputs = []
-            sample_outputs = []
-            sample_gts = []
-            sample_scores = []
-            sample_turns = []
-            sample_uids = []
-
-            for test_data in self.val_dataloaders[f"model_{i}"]:
-                test_batch = DataProto.from_single_dict(test_data)
-
-                if "uid" not in test_batch.non_tensor_batch:
-                    test_batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
-                    )
-
-                # repeat test batch
-                test_batch = test_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-                )
-
-                # we only do validation on rule-based rm
-                if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                    return {}
-
-                # Store original inputs
-                input_ids = test_batch.batch["input_ids"]
-                # TODO: Can we keep special tokens except for padding tokens?
-                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                sample_inputs.extend(input_texts)
-                sample_uids.extend(test_batch.non_tensor_batch["uid"])
-
-                ground_truths = [
-                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-                ]
-                sample_gts.extend(ground_truths)
-
-                test_gen_batch = self._get_gen_batch(test_batch)
-                test_gen_batch.meta_info = {
-                    "eos_token_id": self.tokenizers[f"model_{i}"].eos_token_id,
-                    "pad_token_id": self.tokenizers[f"model_{i}"].pad_token_id,
-                    "recompute_log_prob": False,
-                    "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                    "validate": True,
-                    "global_steps": self.global_steps,
-                }
-                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
-                # pad to be divisible by dp_size
-                size_divisor = (
-                    self.actor_rollout_wgs[f"model_{i}"].world_size
-                    if not self.async_rollout_mode
-                    else self.config.actor_rollout_ref.rollout.agent.num_workers
-                )
-                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-                if not self.async_rollout_mode:
-                    test_output_gen_batch_padded = self.actor_rollout_wgs[f"model_{i}"].generate_sequences(test_gen_batch_padded)
-                else:
-                    test_output_gen_batch_padded = self.async_rollout_managers[f"model_{i}"].generate_sequences(test_gen_batch_padded)
-
-                # unpad
-                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
-                print("validation generation end")
-
-                # Store generated outputs
-                output_ids = test_output_gen_batch.batch["responses"]
-                output_texts = [self.tokenizers[f"model_{i}"].decode(ids, skip_special_tokens=True) for ids in output_ids]
-                sample_outputs.extend(output_texts)
-
-                test_batch = test_batch.union(test_output_gen_batch)
-                test_batch.meta_info["validate"] = True
-
-                # evaluate using reward_function
-                if self.val_reward_fns is None:
-                    raise ValueError("val_reward_fn must be provided for validation.")
-                result = self.val_reward_fns[f"model_{i}"](test_batch, return_dict=True)
-                reward_tensor = result["reward_tensor"]
-                scores = reward_tensor.sum(-1).cpu().tolist()
-                sample_scores.extend(scores)
-
-                reward_extra_infos_dict["reward"].extend(scores)
-                print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
-                if "reward_extra_info" in result:
-                    for key, lst in result["reward_extra_info"].items():
-                        reward_extra_infos_dict[key].extend(lst)
-                        print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
-
-                # collect num_turns of each prompt
-                if "__num_turns__" in test_batch.non_tensor_batch:
-                    sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
-
-                data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-            
-            # TODO: update the multi-agent log
-            self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-            # dump generations
-            val_data_dir = self.config.trainer.get("validation_data_dir", None)
-            if val_data_dir:
-                self._dump_generations(
-                    inputs=sample_inputs,
-                    outputs=sample_outputs,
-                    gts=sample_gts,
-                    scores=sample_scores,
-                    reward_extra_infos_dict=reward_extra_infos_dict,
-                    dump_path=val_data_dir,
-                )
-
-            for key_info, lst in reward_extra_infos_dict.items():
-                assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
-            data_sources = np.concatenate(data_source_lst, axis=0)
-
-            data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-            for data_source, var2metric2val in data_src2var2metric2val.items():
-                core_var = "acc" if "acc" in var2metric2val else "reward"
-                for var_name, metric2val in var2metric2val.items():
-                    n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                    for metric_name, metric_val in metric2val.items():
-                        if (
-                            (var_name == core_var)
-                            and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                            and (f"@{n_max}" in metric_name)
-                        ):
-                            metric_sec = "val-core"
-                        else:
-                            metric_sec = "val-aux"
-                        pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}/model_{i}"
-                        metric_dict[pfx] = metric_val
-
-            if len(sample_turns) > 0:
-                sample_turns = np.concatenate(sample_turns)
-                metric_dict[f"val-aux/num_turns/min/model_{i}"] = sample_turns.min()
-                metric_dict[f"val-aux/num_turns/max/model_{i}"] = sample_turns.max()
-                metric_dict[f"val-aux/num_turns/mean/model_{i}"] = sample_turns.mean()
-
-        return metric_dict
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -812,38 +666,6 @@ class RayMAPPOTrainer:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
-    # TODO: update for multi-agent
-    def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
-    ):
-        """Log rollout data to disk.
-        Args:
-            batch (DataProto): The batch containing rollout data
-            reward_extra_infos_dict (dict): Additional reward information to log
-            timing_raw (dict): Timing information for profiling
-            rollout_data_dir (str): Directory path to save the rollout data
-        """
-        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-            inputs = self.tokenizers.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizers.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-
-            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
-                    "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
-                )
-
-            self._dump_generations(
-                inputs=inputs,
-                outputs=outputs,
-                gts=sample_gts,
-                scores=scores,
-                reward_extra_infos_dict=reward_extra_infos_to_dump,
-                dump_path=rollout_data_dir,
-            )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1619,11 +1441,23 @@ class RayMAPPOTrainer:
         with marked_timer(f"update_actor_a{agent_idx}", timing_raw, color="red"):
             batch=round_agent_batches[r][agent_idx]
             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+            # DataParallelPPOActor.update_policy reads temperature from data.meta_info to
+            # rescale logits — the base RayPPOTrainer._update_actor sets it here, the
+            # MAPPO override missed it.
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             actor_output = self.actor_rollout_wgs[agent_key].update_actor(batch)
         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
         round_agent_metrics[r][agent_idx].update(actor_output_metrics)
         # Sync updated FSDP weights back to vLLM and restore KV cache (Fix 4).
         if self.async_rollout_mode:
+            # update_weights' resume()/IPC sandwich (fsdp_workers) maps the
+            # weights+kv_cache cumem pools, so it must run on a sleeping engine.
+            # For r=0 the engine is already asleep from the last rollout sleep_replicas.
+            # For r>0 the previous _update_actor left it awake — re-sleep here so
+            # the next resume(["weights"]) doesn't hit "CUDA invalid argument" by
+            # cuMemMap'ing an already-mapped pool.
+            if r > 0:
+                self.checkpoint_managers[agent_key].sleep_replicas()
             self.checkpoint_managers[agent_key].update_weights(self.global_steps)
 
     def _update_metrics(self,r,agent_idx,round_agent_batches,round_agent_metrics,timing_raw,metrics):
@@ -1802,8 +1636,6 @@ class RayMAPPOTrainer:
                         futures=[]
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx,agent_key in enumerate(agent_keys):
-                                if r == num_rounds - 1 and agent_idx == 1:
-                                    continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
                                         self._update_critic,
@@ -1824,8 +1656,6 @@ class RayMAPPOTrainer:
                         futures=[]
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx,agent_key in enumerate(agent_keys):
-                                if r == num_rounds - 1 and agent_idx == 1:
-                                    continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
                                         self._update_actor,
@@ -1933,51 +1763,74 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         """Use a unified discussion prompt for all agents."""
         ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
         return ma.get("discussion_prompt", "The discussion history is as follows:")
-    def _apply_kl_penalty(self, data: DataProto, data_ref: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
-        """Apply adversarial KL penalty to constrain the adversary near the hero's policy.
+    def _apply_kl_penalty(
+        self,
+        adv_data: DataProto,
+        hero_actor_wg,
+        kl_ctrl: core_algos.AdaptiveKLController,
+        kl_penalty: str = "kl",
+    ):
+        """SRPO adversary KL regularizer: penalize KL(pi_adv || pi_hero) on adv samples.
 
-        In RayRiskAverseTrainer: agent 0 = adversary, agent 1 = hero (risk-averse).
-        Call with data=adversary_batch and data_ref=hero_batch.
+        Implements the regularizer from the SRPO paper (eq. 9):
+            adversary_loss -= (1/tau) * KL(pi_adv || pi_hero),
+        with the k1 estimator
+            KL(pi_adv || pi_hero) ≈ E_{t~pi_adv at s~adv}[ log pi_adv(t|s) - log pi_hero(t|s) ].
 
-        The KL divergence is computed between the adversary's old_log_probs and the hero's
-        old_log_probs (proxy for reference policy), penalising the adversary for deviating
-        too far from the hero's behaviour distribution.
+        Both logprobs must be evaluated on the SAME (state, token) pairs — the
+        adversary's own rollout. `adv_data["old_log_probs"]` already holds
+        log pi_adv(t_adv | s_adv); we obtain log pi_hero(t_adv | s_adv) by
+        running the hero actor's FSDP forward on the adversary batch via
+        `hero_actor_wg.compute_log_prob(adv_data)`.
+
+        The previous implementation passed the hero's own rollout batch as
+        `data_ref` and subtracted log pi_hero(t_hero | s_hero) from
+        log pi_adv(t_adv | s_adv) — logprobs of different random variables at
+        different states. That quantity is not a divergence and only reflected
+        rollout sampling noise (~1e-2 between two near-identical LoRA checkpoints).
 
         Args:
-            data (DataProto): Adversary (agent 0) batch — receives the KL penalty.
-            data_ref (DataProto): Hero (agent 1) batch — acts as the reference distribution.
-            kl_ctrl (core_algos.AdaptiveKLController): Adaptive KL coefficient controller.
-            kl_penalty (str): KL penalty type ("kl", "abs", "mse", "full"). Defaults to "kl".
+            adv_data: Adversary (agent 0) rollout batch — receives the KL penalty.
+            hero_actor_wg: RayWorkerGroup wrapping the hero (agent 1) actor.
+            kl_ctrl: KL coefficient controller; `kl_ctrl.value` is `1/tau`.
+            kl_penalty: Estimator name forwarded to `core_algos.kl_penalty`
+                ("kl"/"k1", "abs", "mse"/"k2", "low_var_kl"/"k3").
 
         Returns:
-            tuple:
-                - data with token_level_rewards adjusted by adversarial KL penalty
-                - dict of KL metrics (penalty value and coefficient)
+            (adv_data with adjusted token_level_rewards, metrics dict).
         """
-        response_mask = data.batch["response_mask"]
-        token_level_scores = data.batch["token_level_scores"]
-        batch_size = data.batch.batch_size[0]
+        response_mask = adv_data.batch["response_mask"]
+        token_level_scores = adv_data.batch["token_level_scores"]
+        batch_size = adv_data.batch.batch_size[0]
+        adv_log_probs = adv_data.batch["old_log_probs"]
 
-        # compute kl between ref_policy and current policy
-        # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-        kld = core_algos.kl_penalty(
-            data.batch["old_log_probs"], data_ref.batch["old_log_probs"], kl_penalty=kl_penalty
-        )  # (batch_size, response_length)
+        # Evaluate hero policy on adversary trajectories. compute_log_prob runs
+        # an FSDP forward of the hero actor (LoRA-adapted, since is_lora is not
+        # set) on adv_data's input_ids and returns `old_log_probs` =
+        # log pi_hero(t_adv | s_adv). The hero actor is FSDP-resident in GPU
+        # regardless of vLLM sleep state, so this is independent of cumem.
+        hero_lp_proto = hero_actor_wg.compute_log_prob(adv_data)
+        hero_log_probs = hero_lp_proto.batch["old_log_probs"].to(adv_log_probs.device)
+
+        kld = core_algos.kl_penalty(adv_log_probs, hero_log_probs, kl_penalty=kl_penalty)
         kld = kld * response_mask
-        beta = kl_ctrl.value
+        beta = kl_ctrl.value  # = 1/tau
 
+        # back_propogate_reward already set adversary scores to -hero_return;
+        # subtracting beta*kld further penalizes drift from the hero policy.
         token_level_rewards = token_level_scores - beta * kld
 
-        current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+        current_kl = masked_mean(kld, mask=response_mask, axis=-1)
         current_kl = torch.mean(current_kl, dim=0).item()
 
-        # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
         kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
-        data.batch["token_level_rewards"] = token_level_rewards
+        adv_data.batch["token_level_rewards"] = token_level_rewards
 
-        metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
-
-        return data, metrics
+        metrics = {
+            "actor/reward_kl_penalty": current_kl,
+            "actor/reward_kl_penalty_coeff": beta,
+        }
+        return adv_data, metrics
     def _build_input_ids_from_histories(
         self,
         system_prompt,
@@ -2061,6 +1914,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         num_agents = int(ma.get("num_agents", 1))
         num_rounds = int(ma.get("num_rounds", 1))
         risk_coef = float(ma.get("risk_coef", 1.0))
+        adversary_kl_to_hero = bool(ma.get("adversary_kl_to_hero", False))
         agent_keys = list(self.train_dataloaders.keys())
 
         logger = Tracking(
@@ -2160,16 +2014,27 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                     histories[:] = [f"[Last round]: {new}" for new in this_round]
                 # Agent 0 = adversary, Agent 1 = hero (risk-averse).
                 # back_propogate_reward (overridden in this class) applies cross-round
-                # adversarial discounting, then KL penalty constrains adversary near hero.
+                # adversarial discounting; the SRPO regularizer below optionally
+                # constrains the adversary near the hero's policy.
                 self.back_propogate_reward(num_rounds, num_agents, round_agent_batches, gamma=risk_coef)
-                for r in range(num_rounds):
-                    round_agent_batches[r][0], kl_metrics = self._apply_kl_penalty(
-                        round_agent_batches[r][0],
-                        round_agent_batches[r][1],
-                        self.kl_ctrl_in_reward,
-                        self.config.algorithm.kl_penalty,
-                    )
-                    round_agent_metrics[r][0].update(kl_metrics)
+                if adversary_kl_to_hero:
+                    hero_actor_wg = self.actor_rollout_wgs[agent_keys[1]]
+                    for r in range(num_rounds):
+                        round_agent_batches[r][0], kl_metrics = self._apply_kl_penalty(
+                            round_agent_batches[r][0],
+                            hero_actor_wg,
+                            self.kl_ctrl_in_reward,
+                            self.config.algorithm.kl_penalty,
+                        )
+                        round_agent_metrics[r][0].update(kl_metrics)
+                else:
+                    # SRPO KL regularizer disabled: pass adversary scores through
+                    # unchanged. Set token_level_rewards explicitly here so the
+                    # hero-side branch below skips the adversary (it short-circuits
+                    # when the field is already populated).
+                    for r in range(num_rounds):
+                        adv_batch = round_agent_batches[r][0]
+                        adv_batch.batch["token_level_rewards"] = adv_batch.batch["token_level_scores"]
 
                 if self.config.algorithm.use_kl_in_reward:
                     for r in range(num_rounds):
@@ -2231,6 +2096,8 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx, agent_key in enumerate(agent_keys):
+                                if r == num_rounds - 1 and agent_idx == 1:
+                                    continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
                                         self._update_critic,
@@ -2251,6 +2118,8 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx, agent_key in enumerate(agent_keys):
+                                if r == num_rounds - 1 and agent_idx == 1:
+                                    continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
                                         self._update_actor,
