@@ -585,12 +585,24 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self):
-        if self.node_rank != 0:
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            # Symmetric to sleep(): when free_cache_engine is disabled the
+            # engine is never put to sleep, so any wake_up call would try to
+            # cuMemMap an already-mapped pool and crash with CUDA invalid arg.
             return
 
         if self.rollout_mode == RolloutMode.HYBRID:
-            # In hybrid mode, rollout is wake up in `update_weights`
-            raise ValueError(f"wake_up not support rollout_mode {self.rollout_mode}")
+            # Symmetric to _sleep_hybrid for inter-round wake (the colocated MAPPO
+            # trainer puts the engine to sleep after each round's generate to share
+            # the GPU with FSDP critic). Wake both pools regardless of sleep level:
+            # cumem pools that were never freed treat wake_up as a no-op, so passing
+            # ["weights","kv_cache"] is safe under either level. With LoRA the level=1
+            # sleep nominally frees only KV cache, but waking the weights pool too
+            # also re-registers the LoRA adapter mappings the punica wrapper relies on
+            # — narrower tags hit a CUDA "invalid argument" inside punica's update.
+            await self.engine.collective_rpc("wake_up", kwargs={"tags": ["weights", "kv_cache"]})
+            await self.engine.reset_prefix_cache()
+            self._is_sleeping = False
         elif self.rollout_mode == RolloutMode.COLOCATED:
             # Directly call engine to wake up without sync weights.
             await self.engine.wake_up(tags=self._get_wake_up_tags())
