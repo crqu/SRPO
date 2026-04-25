@@ -619,10 +619,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
         fsdp_strategy = self.config.actor.strategy
         if fsdp_strategy == "fsdp":
-            # When world_size=1, FSDP uses NO_SHARD and checks that params are on GPU
-            # before sync_module_states broadcasting — the device_id migration doesn't
-            # run early enough in that path. Move rank-0 model to GPU explicitly.
-            if self.rank == 0:
+            # When world_size=1, FSDP uses NO_SHARD and checks that params/buffers
+            # are on GPU before sync_module_states broadcasting — the device_id
+            # migration doesn't run early enough in that path, and PEFT/LoRA leaves
+            # some buffers on CPU even after .to(device). Since there are no other
+            # ranks to broadcast to, disable sync_module_states and move the model
+            # to GPU explicitly.
+            mesh_world_size = self.device_mesh.size()
+            sync_module_states = mesh_world_size > 1
+            if not sync_module_states:
                 actor_module = actor_module.to(get_device_id())
             actor_module_fsdp = FSDP(
                 actor_module,
@@ -632,7 +637,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,  # zero3
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
+                sync_module_states=sync_module_states,
                 device_mesh=self.device_mesh,
                 use_orig_params=self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
@@ -1588,7 +1593,9 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
         if config.strategy == "fsdp":
-            if self.rank == 0:
+            mesh_world_size = self.device_mesh.size()
+            sync_module_states = mesh_world_size > 1
+            if not sync_module_states:
                 critic_module = critic_module.to(get_device_id())
             critic_module = FSDP(
                 critic_module,
@@ -1598,7 +1605,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 device_id=get_device_id(),
                 sharding_strategy=sharding_strategy,
                 mixed_precision=mixed_precision,
-                sync_module_states=True,
+                sync_module_states=sync_module_states,
                 forward_prefetch=self.config.fsdp.forward_prefetch,
                 device_mesh=self.device_mesh,
                 cpu_offload=None,
