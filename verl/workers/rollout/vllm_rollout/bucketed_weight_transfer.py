@@ -155,6 +155,19 @@ class BucketedWeightSender:
 
     def _init_socket(self):
         """Initialize ZMQ REQ socket and bind."""
+        # ZMQ ipc:// sockets are unlinked on a clean close(), but a crashed
+        # prior run leaves the socket file behind and bind() fails with
+        # EADDRINUSE. Remove any stale file we own before re-binding.
+        if self.zmq_handle.startswith("ipc://"):
+            stale_path = self.zmq_handle[len("ipc://"):]
+            try:
+                os.unlink(stale_path)
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                logger.warning(
+                    "Could not unlink stale IPC socket %s: %s", stale_path, e
+                )
         self.socket = self.zmq_context.socket(zmq.REQ)
         self.socket.bind(self.zmq_handle)
 

@@ -106,7 +106,9 @@ class ServerAdapter(BaseRollout):
             self.sleep_level = VLLM_SLEEP_LEVEL
 
         self.device_uuid = get_device_uuid(get_device_id())
-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{self.device_uuid}.sock"
+        # Include uid in the socket path so different users sharing the same
+        # physical node/GPU don't collide on a stale ipc socket file in /tmp.
+        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{os.getuid()}-{self.device_uuid}.sock"
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
