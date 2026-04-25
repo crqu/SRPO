@@ -47,6 +47,27 @@ is_cuda_available = torch.cuda.is_available()
 is_npu_available = is_torch_npu_available()
 
 
+def _refresh_accelerator_cache() -> tuple[bool, bool]:
+    """Re-detect accelerator availability and refresh module-level cache.
+
+    The module-level ``is_cuda_available`` / ``is_npu_available`` flags are
+    evaluated at import time. In Ray actors, ``CUDA_VISIBLE_DEVICES`` is
+    sometimes set *after* this module is imported (e.g. by
+    ``Worker._setup_env_cuda_visible_devices`` in ``single_controller``), so
+    the cached value can be a stale ``False``. This helper re-runs the
+    detection and upgrades the cache (False -> True only — we never demote
+    a previously-detected accelerator).
+    """
+    global is_cuda_available, is_npu_available
+    cuda_now = torch.cuda.is_available()
+    npu_now = is_torch_npu_available()
+    if cuda_now and not is_cuda_available:
+        is_cuda_available = True
+    if npu_now and not is_npu_available:
+        is_npu_available = True
+    return cuda_now, npu_now
+
+
 def get_resource_name() -> str:
     """Function that return ray resource name based on the device type.
     Returns:
@@ -74,16 +95,18 @@ def get_device_name() -> str:
     Detects the available accelerator and returns the corresponding PyTorch
     device type string. Currently supports CUDA, Ascend NPU, and CPU.
 
+    Re-evaluates accelerator availability at call time so Ray actors that set
+    ``CUDA_VISIBLE_DEVICES`` after module import still get ``"cuda"``.
+
     Returns:
         str: Device type string ('cuda', 'npu', or 'cpu').
     """
-    if is_cuda_available:
-        device = "cuda"
-    elif is_npu_available:
-        device = "npu"
-    else:
-        device = "cpu"
-    return device
+    cuda_now, npu_now = _refresh_accelerator_cache()
+    if cuda_now:
+        return "cuda"
+    if npu_now:
+        return "npu"
+    return "cpu"
 
 
 def get_torch_device():
@@ -109,8 +132,26 @@ def get_device_id() -> int:
 
     Returns:
         int: The current device index (e.g., 0 for 'cuda:0').
+
+    Raises:
+        RuntimeError: If no accelerator is available. Returning a sentinel
+            (e.g. the string ``"cpu"`` from ``torch.cpu.current_device()``)
+            silently propagates into vLLM/torch as an invalid index, so we
+            fail fast here instead.
     """
-    return get_torch_device().current_device()
+    device = get_torch_device()
+    # ``torch.cpu.current_device()`` returns the string ``"cpu"`` rather than
+    # an int, which crashes downstream consumers (e.g. vLLM's
+    # ``device_id_to_physical_device_id`` does ``device_ids[device_id]``).
+    if device is torch.cpu:
+        raise RuntimeError(
+            "get_device_id() called but no CUDA/NPU accelerator is available. "
+            "This usually means CUDA_VISIBLE_DEVICES was unset or empty when "
+            "this process started. Check that the Ray actor is allocated GPUs "
+            "and that RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0 is set on head-node "
+            "actors that previously had zero GPUs."
+        )
+    return device.current_device()
 
 
 def get_nccl_backend() -> str:
