@@ -85,10 +85,6 @@ case "$METHOD" in
         ;;
 esac
 
-# Cross-pair probe partner: optional. Default empty (probe disabled).
-# To enable, export PARTNER_CKPT_DIR=/path/to/sibling/arm/ckpt before invocation.
-PARTNER_CKPT_DIR="${PARTNER_CKPT_DIR:-}"
-
 LOG_FILE="logs/${EXP_NAME}_$(date +%Y%m%d_%H%M%S).log"
 echo "[INFO] Logging to ${LOG_FILE}"
 
@@ -138,7 +134,6 @@ PYTHONUNBUFFERED=1 python -m verl.trainer.main_mappo \
     trainer.experiment_name=${EXP_NAME} \
     trainer.logger=[console] \
     trainer.val_before_train=False \
-    multi_agent.cross_pair_probe.partner_ckpt_dir=${PARTNER_CKPT_DIR} \
     ${ENTROPY_OVERRIDE} \
     2>&1 | tee "${LOG_FILE}"
 RC=${PIPESTATUS[0]}

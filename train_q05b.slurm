@@ -1,7 +1,17 @@
 #!/bin/bash
 # Usage:
-#   sbatch train_q05b.slurm              # IPPO (default)
-#   METHOD=srpo sbatch train_q05b.slurm  # SRPO
+#   sbatch train_q05b.slurm                          # IPPO (default)
+#   METHOD=srpo_main sbatch train_q05b.slurm         # SRPO main (entropy-asymmetric)
+#   METHOD=srpo_reward_only sbatch train_q05b.slurm  # SRPO reward-only ablation
+#
+# Cross-pair probe is OFFLINE (separate invocation on saved checkpoints):
+#   python -m verl.trainer.main_mappo \
+#     +multi_agent.cross_pair_probe.run_only=true \
+#     multi_agent.cross_pair_probe.partner_ckpt_dir=<sibling-arm>/global_step_N \
+#     multi_agent.cross_pair_probe.out_path=logs/probe_<method>_step_N.json \
+#     trainer.resume_mode=resume_path \
+#     trainer.resume_from_path=<this-arm>/global_step_N \
+#     <all other config args from below...>
 #
 #SBATCH --job-name=mappo_q05b
 #SBATCH --nodes=2
@@ -66,11 +76,11 @@ export WANDB_MODE=offline
 # node's processes, which then propagates to WorkerDict actors on the same node
 # causing "Flash Attention 2 not available on CPU" errors for agent_pool_1.
 export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
-export CUDA_LAUNCH_BLOCKING=1
 export HYDRA_FULL_ERROR=1
-export RAY_DEDUP_LOGS=0
-export RAY_BACKEND_LOG_LEVEL=debug
-export VLLM_LOGGING_LEVEL=DEBUG
+# Production logging: dedup Ray logs and turn down vLLM/Ray verbosity. Flip to
+# DEBUG only when reproducing a hang or LoRA/cumem issue.
+export RAY_BACKEND_LOG_LEVEL=info
+export VLLM_LOGGING_LEVEL=INFO
 nvidia-smi
 
 NUM_NODES=${SLURM_JOB_NUM_NODES:-2}
@@ -158,10 +168,6 @@ case "$METHOD" in
         ;;
 esac
 
-# Cross-pair probe partner: optional. Default empty (probe disabled).
-# To enable, export PARTNER_CKPT_DIR=/path/to/sibling/arm/ckpt before invocation.
-PARTNER_CKPT_DIR="${PARTNER_CKPT_DIR:-}"
-
 # Debug info
 echo "[DEBUG] hostname=$(hostname)"
 echo "[DEBUG] pwd=$(pwd)"
@@ -209,6 +215,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         actor_rollout_ref.rollout.load_format=safetensors \
         actor_rollout_ref.rollout.calculate_log_probs=true \
         actor_rollout_ref.rollout.enforce_eager=true \
+        actor_rollout_ref.rollout.free_cache_engine=false \
         +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=NONE \
         actor_rollout_ref.model.path=${MODEL_NAME} \
         actor_rollout_ref.model.lora_rank=32 \
@@ -219,8 +226,9 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         critic.ppo_micro_batch_size_per_gpu=32 \
         algorithm.kl_ctrl.kl_coef=${KL_COEF} \
         trainer.total_training_steps=200 \
-        trainer.test_freq=10 \
+        trainer.test_freq=20 \
         trainer.save_freq=50 \
+        trainer.resume_mode=auto \
         trainer.nnodes=${NUM_NODES} \
         trainer.n_gpus_per_node=${GPUS_PER_NODE} \
         trainer.default_local_dir=${CKPT_DIR} \
@@ -228,7 +236,6 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         trainer.experiment_name=${EXP_NAME} \
         trainer.logger=[console,wandb] \
         trainer.val_before_train=True \
-        multi_agent.cross_pair_probe.partner_ckpt_dir=${PARTNER_CKPT_DIR} \
         ${ENTROPY_OVERRIDE}" \
     2>&1 | tee "logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
