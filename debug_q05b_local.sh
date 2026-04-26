@@ -6,7 +6,7 @@
 set -x
 set -o pipefail
 
-METHOD=${METHOD:-srpo}
+METHOD=${METHOD:-srpo_main}
 
 REPO_DIR=/weka/scratch/lshi40_llm/mallm/SRPO
 CKPT_DIR=${REPO_DIR}/checkpoints/${METHOD}_q05b_dbg
@@ -64,15 +64,30 @@ done
 ray status
 
 # Method-specific config
-if [ "$METHOD" = "srpo" ]; then
-    TRAINER_TYPE="risk_averse"
-    KL_COEF=0.1
-    EXP_NAME="srpo_q05b_dbg"
-else
-    TRAINER_TYPE="mappo"
-    KL_COEF=0.001
-    EXP_NAME="ippo_q05b_dbg"
-fi
+case "$METHOD" in
+    srpo_main)
+        TRAINER_TYPE="risk_averse"
+        KL_COEF=0.1
+        EXP_NAME="srpo_main_q05b_dbg"
+        ENTROPY_OVERRIDE="+multi_agent.agents.0.actor.actor.entropy_coeff=0.05"
+        ;;
+    srpo_reward_only)
+        TRAINER_TYPE="risk_averse"
+        KL_COEF=0.1
+        EXP_NAME="srpo_reward_only_q05b_dbg"
+        ENTROPY_OVERRIDE=""
+        ;;
+    ippo|*)
+        TRAINER_TYPE="mappo"
+        KL_COEF=0.001
+        EXP_NAME="ippo_q05b_dbg"
+        ENTROPY_OVERRIDE=""
+        ;;
+esac
+
+# Cross-pair probe partner: optional. Default empty (probe disabled).
+# To enable, export PARTNER_CKPT_DIR=/path/to/sibling/arm/ckpt before invocation.
+PARTNER_CKPT_DIR="${PARTNER_CKPT_DIR:-}"
 
 LOG_FILE="logs/${EXP_NAME}_$(date +%Y%m%d_%H%M%S).log"
 echo "[INFO] Logging to ${LOG_FILE}"
@@ -123,6 +138,8 @@ PYTHONUNBUFFERED=1 python -m verl.trainer.main_mappo \
     trainer.experiment_name=${EXP_NAME} \
     trainer.logger=[console] \
     trainer.val_before_train=False \
+    multi_agent.cross_pair_probe.partner_ckpt_dir=${PARTNER_CKPT_DIR} \
+    ${ENTROPY_OVERRIDE} \
     2>&1 | tee "${LOG_FILE}"
 RC=${PIPESTATUS[0]}
 

@@ -7,7 +7,7 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --mem=100G
-#SBATCH --partition=nvl,l40s,h100,a100
+#SBATCH --partition=nvl,h100
 #SBATCH --gres=gpu:1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
@@ -15,7 +15,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=l07,l08,l03,l05,n01,n06
+#SBATCH --exclude=l02,l04,l05,l06
 
 set -x
 
@@ -137,15 +137,30 @@ if [ "${ALIVE:-0}" -lt "${NUM_NODES}" ]; then
 fi
 
 # Method-specific config
-if [ "$METHOD" = "srpo" ]; then
-    TRAINER_TYPE="risk_averse"
-    KL_COEF=0.1          # adversary KL regularization = 1/tau, tau=10
-    EXP_NAME="srpo_q05b"
-else
-    TRAINER_TYPE="mappo"
-    KL_COEF=0.001        # standard PPO default (not applied to rewards by default)
-    EXP_NAME="ippo_q05b"
-fi
+case "$METHOD" in
+    srpo_main)
+        TRAINER_TYPE="risk_averse"
+        KL_COEF=0.1          # adversary KL regularization = 1/tau, tau=10
+        EXP_NAME="srpo_main_q05b"
+        ENTROPY_OVERRIDE="+multi_agent.agents.0.actor.actor.entropy_coeff=0.05"
+        ;;
+    srpo_reward_only)
+        TRAINER_TYPE="risk_averse"
+        KL_COEF=0.1
+        EXP_NAME="srpo_reward_only_q05b"
+        ENTROPY_OVERRIDE=""
+        ;;
+    ippo|*)
+        TRAINER_TYPE="mappo"
+        KL_COEF=0.001        # standard PPO default (not applied to rewards by default)
+        EXP_NAME="ippo_q05b"
+        ENTROPY_OVERRIDE=""
+        ;;
+esac
+
+# Cross-pair probe partner: optional. Default empty (probe disabled).
+# To enable, export PARTNER_CKPT_DIR=/path/to/sibling/arm/ckpt before invocation.
+PARTNER_CKPT_DIR="${PARTNER_CKPT_DIR:-}"
 
 # Debug info
 echo "[DEBUG] hostname=$(hostname)"
@@ -212,7 +227,9 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         trainer.project_name=srpo_experiments \
         trainer.experiment_name=${EXP_NAME} \
         trainer.logger=[console,wandb] \
-        trainer.val_before_train=True" \
+        trainer.val_before_train=True \
+        multi_agent.cross_pair_probe.partner_ckpt_dir=${PARTNER_CKPT_DIR} \
+        ${ENTROPY_OVERRIDE}" \
     2>&1 | tee "logs/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
 echo "[INFO] Training finished: METHOD=${METHOD}"
