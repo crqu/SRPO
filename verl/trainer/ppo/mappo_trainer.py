@@ -62,6 +62,14 @@ import verl.utils.torch_functional as verl_F
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_response_mask
 
 
+# Cross-pair probe (spec §6.2): keys for the lazily-instantiated frozen partner.
+PROBE_PARTNER_KEY = "probe_partner"
+PROBE_PARTNER_WG_NAME = f"actor_rollout_{PROBE_PARTNER_KEY}"
+# Sentinel rollout.agent_index for the probe partner; chosen to be distinct from
+# any trained slot (0..num_agents-1) so log filters on agent_index can exclude it.
+PROBE_PARTNER_AGENT_INDEX = 99
+
+
 def _extract_final_answer(text: str) -> str | None:
     """Return the substring after the last '####', stripped. None if marker absent."""
     if "####" not in text:
@@ -90,8 +98,6 @@ def _compute_cheap_diagnostics(
         Round-0 conditional metrics (hero_recovery, corrupted_by_debate, answer_flip)
         are emitted only for r >= 1.
     """
-    import numpy as np
-
     metrics: dict = {}
 
     answers = {
@@ -734,9 +740,15 @@ class RayMAPPOTrainer:
         """Run validation-shaped rollouts with one trained agent swapped for probe_partner.
 
         Returns a flat dict of cross_pair/<...> metric keys. Returns {} if probe_partner
-        is not loaded. Spec §6.2.
+        is not loaded or this validation tick is between scheduled probe steps. Spec §6.2.
         """
         if not getattr(self, "_partner_ckpt_dir", None):
+            return {}
+
+        probe_cfg = OmegaConf.select(self.config, "multi_agent.cross_pair_probe", default={}) or {}
+        every_n = int(probe_cfg.get("every_n_val_steps", 1) or 1)
+        self._probe_val_tick = getattr(self, "_probe_val_tick", 0) + 1
+        if every_n > 1 and (self._probe_val_tick % every_n) != 0:
             return {}
 
         ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
@@ -744,10 +756,10 @@ class RayMAPPOTrainer:
         num_rounds = int(ma.get("num_rounds", 1))
         assert num_agents == 2, "Cross-pair probe requires exactly 2 agents."
 
-        agent_keys = list(self.train_dataloaders.keys())
+        agent_keys = list(self.val_dataloaders.keys())
         directions = {
-            "srpo_first": [agent_keys[0], "probe_partner"],
-            "srpo_second": ["probe_partner", agent_keys[1]],
+            "srpo_first": [agent_keys[0], PROBE_PARTNER_KEY],
+            "srpo_second": [PROBE_PARTNER_KEY, agent_keys[1]],
         }
 
         out: dict = {}
@@ -814,7 +826,7 @@ class RayMAPPOTrainer:
             both_right = (round_correctness[r_last][0] & round_correctness[r_last][1]).astype(float)
             out[f"cross_pair/joint_acc/{direction}"] = float(both_right.mean())
 
-            trained_idx = 0 if keys_for_round[0] != "probe_partner" else 1
+            trained_idx = 0 if keys_for_round[0] != PROBE_PARTNER_KEY else 1
             out[f"cross_pair/trained_agent_acc/{direction}"] = float(
                 round_correctness[r_last][trained_idx].mean()
             )
@@ -1028,13 +1040,13 @@ class RayMAPPOTrainer:
                 deepcopy(self.config.actor_rollout_ref),
                 OmegaConf.select(self.config, "multi_agent.agents.0.actor", default={}) or {},
             )
-            OmegaConf.update(partner_actor_cfg, "rollout.agent_index", 99, force_add=True)
+            OmegaConf.update(partner_actor_cfg, "rollout.agent_index", PROBE_PARTNER_AGENT_INDEX, force_add=True)
             partner_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=partner_actor_cfg,
                 role="actor_rollout",
             )
-            self.resource_pool_to_cls[partner_pool]["actor_rollout_probe_partner"] = partner_cls
+            self.resource_pool_to_cls[partner_pool][PROBE_PARTNER_WG_NAME] = partner_cls
             self._partner_ckpt_dir = partner_ckpt_dir
         else:
             self._partner_ckpt_dir = None
@@ -1066,9 +1078,9 @@ class RayMAPPOTrainer:
             self.actor_rollout_wgs[f"model_{i}"] = actor_wg
 
         if self._partner_ckpt_dir:
-            partner_wg = all_wg["actor_rollout_probe_partner"]
+            partner_wg = all_wg[PROBE_PARTNER_WG_NAME]
             partner_wg.init_model()
-            self.actor_rollout_wgs["probe_partner"] = partner_wg
+            self.actor_rollout_wgs[PROBE_PARTNER_KEY] = partner_wg
 
         self.critic_wgs = {}
         if self.use_critic:
@@ -1243,7 +1255,7 @@ class RayMAPPOTrainer:
             )
         if getattr(self, "_partner_ckpt_dir", None):
             partner_actor_path = os.path.join(self._partner_ckpt_dir, "actor", "0")
-            self.actor_rollout_wgs["probe_partner"].load_checkpoint(
+            self.actor_rollout_wgs[PROBE_PARTNER_KEY].load_checkpoint(
                 partner_actor_path, del_local_after_load=False
             )
         #load critic
@@ -1820,6 +1832,8 @@ class RayMAPPOTrainer:
 
                 # discussion setting
                 batch_size=self.config.data.train_batch_size
+                # peer_idx = 1 - agent_idx below assumes a 2-agent setup.
+                assert num_agents == 2, "MAPPO rollout currently supports exactly 2 agents."
                 self_history = [[""] * batch_size for _ in range(num_agents)]
                 round_agent_responses = [["" for _ in range(num_agents)] for _ in range(num_rounds)]
                 # rollout
@@ -2259,6 +2273,8 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                 step_durations = []
 
                 batch_size = self.config.data.train_batch_size
+                # peer_idx = 1 - agent_idx below assumes a 2-agent setup.
+                assert num_agents == 2, "SRPO rollout currently supports exactly 2 agents."
                 self_history = [[""] * batch_size for _ in range(num_agents)]
                 round_agent_responses = [["" for _ in range(num_agents)] for _ in range(num_rounds)]
                 for r in range(num_rounds):
