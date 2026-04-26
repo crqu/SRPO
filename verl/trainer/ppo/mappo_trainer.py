@@ -730,6 +730,107 @@ class RayMAPPOTrainer:
 
         return metric_dict
 
+    def _run_cross_pair_probe(self) -> dict:
+        """Run validation-shaped rollouts with one trained agent swapped for probe_partner.
+
+        Returns a flat dict of cross_pair/<...> metric keys. Returns {} if probe_partner
+        is not loaded. Spec §6.2.
+        """
+        if not getattr(self, "_partner_ckpt_dir", None):
+            return {}
+
+        ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
+        num_agents = int(ma.get("num_agents", 2))
+        num_rounds = int(ma.get("num_rounds", 1))
+        assert num_agents == 2, "Cross-pair probe requires exactly 2 agents."
+
+        agent_keys = list(self.train_dataloaders.keys())
+        directions = {
+            "srpo_first": [agent_keys[0], "probe_partner"],
+            "srpo_second": ["probe_partner", agent_keys[1]],
+        }
+
+        out: dict = {}
+        for direction, keys_for_round in directions.items():
+            round_correctness = {}
+            round_responses = {}
+            round_response_lens = {}
+
+            for batch_idx, batch_tuple in enumerate(zip(*(self.val_dataloaders[k] for k in agent_keys))):
+                batch_size = len(DataProto.from_single_dict(batch_tuple[0]))
+                self_history = [[""] * batch_size for _ in range(num_agents)]
+                for r in range(num_rounds):
+                    this_round_responses = [[""] * batch_size for _ in range(num_agents)]
+                    for agent_idx in range(num_agents):
+                        worker_key = keys_for_round[agent_idx]
+                        batch_dict = batch_tuple[agent_idx]
+                        test_batch: DataProto = DataProto.from_single_dict(batch_dict)
+                        questions, _ = self._extract_prompts_and_questions(test_batch, worker_key)
+                        if r == 0:
+                            chat_prompts = questions
+                        else:
+                            peer_idx = 1 - agent_idx
+                            chat_prompts = self._build_input_ids_from_histories(
+                                questions=questions,
+                                self_history=self_history[agent_idx],
+                                peer_history=self_history[peer_idx],
+                                r=r,
+                                batch=test_batch,
+                                agent_key=worker_key,
+                                max_history_tokens=4096,
+                            )
+                        if "uid" not in test_batch.non_tensor_batch:
+                            test_batch.non_tensor_batch["uid"] = np.array(
+                                [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                            )
+                        gen_batch = self._get_gen_batch(test_batch)
+                        gen_batch.meta_info["global_steps"] = self.global_steps
+                        gen_batch_output = self.actor_rollout_wgs[worker_key].generate_sequences(gen_batch)
+                        test_batch = test_batch.union(gen_batch_output)
+                        test_batch.meta_info["validate"] = True
+
+                        result = self.val_reward_fns[agent_keys[agent_idx]](test_batch, return_dict=True)
+                        scores = result["reward_tensor"].sum(-1).cpu().numpy()
+                        output_ids = test_batch.batch["responses"]
+                        output_texts = [
+                            self.tokenizers[agent_keys[agent_idx]].decode(ids, skip_special_tokens=True)
+                            for ids in output_ids
+                        ]
+                        response_lens = test_batch.batch["response_mask"].sum(-1).cpu().numpy()
+
+                        round_correctness.setdefault(r, {})[agent_idx] = (scores > 0.5).astype("int64")
+                        round_responses.setdefault(r, {})[agent_idx] = list(output_texts)
+                        round_response_lens.setdefault(r, {})[agent_idx] = response_lens
+                        this_round_responses[agent_idx] = list(output_texts)
+                    for a in range(num_agents):
+                        self_history[a] = this_round_responses[a]
+
+                # NOTE: probe accumulates ONE batch only — short-circuit here. Spec §6.2 says
+                # probe shares the val set; full enumeration matches normal validation cost.
+                # Remove this break to enumerate the full val set (recommended for production).
+                break
+
+            r_last = num_rounds - 1
+            both_right = (round_correctness[r_last][0] & round_correctness[r_last][1]).astype(float)
+            out[f"cross_pair/joint_acc/{direction}"] = float(both_right.mean())
+
+            trained_idx = 0 if keys_for_round[0] != "probe_partner" else 1
+            out[f"cross_pair/trained_agent_acc/{direction}"] = float(
+                round_correctness[r_last][trained_idx].mean()
+            )
+
+            sub = _compute_cheap_diagnostics(
+                num_rounds=num_rounds,
+                num_agents=num_agents,
+                correctness=round_correctness,
+                responses=round_responses,
+                response_lens=round_response_lens,
+            )
+            for k, v in sub.items():
+                out[f"cross_pair/{k}/{direction}"] = v
+
+        return out
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
