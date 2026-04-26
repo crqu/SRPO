@@ -15,6 +15,7 @@
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
 """
 
+import json
 import os
 import socket
 
@@ -355,6 +356,25 @@ class TaskRunner:
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()
+
+        # Offline cross-pair probe: when the run is invoked with
+        # `multi_agent.cross_pair_probe.run_only=true`, skip training and just
+        # load the trained-arm checkpoint, run the probe against the configured
+        # partner_ckpt_dir, dump metrics, and exit. This decouples the probe
+        # from the hot training loop (avoids the 3-engine GPU memory tax).
+        probe_cfg = OmegaConf.select(config, "multi_agent.cross_pair_probe", default={}) or {}
+        if bool(probe_cfg.get("run_only", False)):
+            trainer._load_checkpoint()
+            metrics = trainer._run_cross_pair_probe()
+            payload = {"global_steps": trainer.global_steps, **metrics}
+            out_path = probe_cfg.get("out_path", None)
+            if out_path:
+                os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+                with open(out_path, "w") as f:
+                    json.dump(payload, f, indent=2)
+                print(f"[cross_pair_probe] wrote {out_path}")
+            print(f"[cross_pair_probe] {json.dumps(payload)}")
+            return
 
         # Start the training process.
         trainer.mappo_fit()

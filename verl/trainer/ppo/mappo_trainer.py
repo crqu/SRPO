@@ -762,6 +762,12 @@ class RayMAPPOTrainer:
             "srpo_second": [PROBE_PARTNER_KEY, agent_keys[1]],
         }
 
+        # Wake the partner replicas (the trained agents are already awake post-validate).
+        # Sleep them again at the end of probe so the next training step starts from a
+        # clean state.
+        if self.async_rollout_mode and PROBE_PARTNER_KEY in self.checkpoint_managers:
+            self.checkpoint_managers[PROBE_PARTNER_KEY].wake_up_replicas()
+
         out: dict = {}
         for direction, keys_for_round in directions.items():
             round_correctness = {}
@@ -782,13 +788,15 @@ class RayMAPPOTrainer:
                             chat_prompts = questions
                         else:
                             peer_idx = 1 - agent_idx
+                            # Use the trained agent's tokenizer slot — partner shares the
+                            # same base model, and self.tokenizers has no probe_partner key.
                             chat_prompts = self._build_input_ids_from_histories(
                                 questions=questions,
                                 self_history=self_history[agent_idx],
                                 peer_history=self_history[peer_idx],
                                 r=r,
                                 batch=test_batch,
-                                agent_key=worker_key,
+                                agent_key=agent_keys[agent_idx],
                                 max_history_tokens=4096,
                             )
                         if "uid" not in test_batch.non_tensor_batch:
@@ -796,8 +804,28 @@ class RayMAPPOTrainer:
                                 [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                             )
                         gen_batch = self._get_gen_batch(test_batch)
-                        gen_batch.meta_info["global_steps"] = self.global_steps
-                        gen_batch_output = self.actor_rollout_wgs[worker_key].generate_sequences(gen_batch)
+                        # Mirror _multi_agent_validate's meta_info: AgentLoopWorker reads
+                        # `validate` to switch sampling params; tokenizer ids cover decode.
+                        tok = self.tokenizers[agent_keys[agent_idx]]
+                        gen_batch.meta_info.update({
+                            "eos_token_id": tok.eos_token_id,
+                            "pad_token_id": tok.pad_token_id,
+                            "recompute_log_prob": False,
+                            "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                            "validate": True,
+                            "global_steps": self.global_steps,
+                        })
+                        size_divisor = (
+                            self.actor_rollout_wgs[worker_key].world_size
+                            if not self.async_rollout_mode
+                            else self.config.actor_rollout_ref.rollout.agent.num_workers
+                        )
+                        gen_batch_padded, pad_size = pad_dataproto_to_divisor(gen_batch, size_divisor)
+                        if not self.async_rollout_mode:
+                            gen_batch_output_padded = self.actor_rollout_wgs[worker_key].generate_sequences(gen_batch_padded)
+                        else:
+                            gen_batch_output_padded = self.async_rollout_managers[worker_key].generate_sequences(gen_batch_padded)
+                        gen_batch_output = unpad_dataproto(gen_batch_output_padded, pad_size=pad_size)
                         test_batch = test_batch.union(gen_batch_output)
                         test_batch.meta_info["validate"] = True
 
@@ -840,6 +868,9 @@ class RayMAPPOTrainer:
             )
             for k, v in sub.items():
                 out[f"cross_pair/{k}/{direction}"] = v
+
+        if self.async_rollout_mode and PROBE_PARTNER_KEY in self.checkpoint_managers:
+            self.checkpoint_managers[PROBE_PARTNER_KEY].sleep_replicas()
 
         return out
 
@@ -1081,6 +1112,10 @@ class RayMAPPOTrainer:
             partner_wg = all_wg[PROBE_PARTNER_WG_NAME]
             partner_wg.init_model()
             self.actor_rollout_wgs[PROBE_PARTNER_KEY] = partner_wg
+            # Load the partner checkpoint eagerly. resume_mode is for trainer-state
+            # resume of the *current arm* and does not gate the probe-partner load.
+            partner_actor_path = os.path.join(self._partner_ckpt_dir, "actor", "0")
+            partner_wg.load_checkpoint(partner_actor_path, del_local_after_load=False)
 
         self.critic_wgs = {}
         if self.use_critic:
@@ -1122,19 +1157,40 @@ class RayMAPPOTrainer:
             # Create one CheckpointEngineManager per agent to coordinate
             # sleep/wake of the vLLM KV cache with FSDP training (Fix 2).
             self.checkpoint_managers = {}
+            checkpoint_engine_config = omega_conf_to_dataclass(
+                self.config.actor_rollout_ref.rollout.checkpoint_engine
+            )
             for i in range(num_agents):
                 agent_key = f"model_{i}"
-                checkpoint_engine_config = omega_conf_to_dataclass(
-                    self.config.actor_rollout_ref.rollout.checkpoint_engine
-                )
                 self.checkpoint_managers[agent_key] = CheckpointEngineManager(
                     config=checkpoint_engine_config,
                     trainer=self.actor_rollout_wgs[agent_key],
                     replicas=self.async_rollout_managers[agent_key].rollout_replicas,
                 )
-            # Free vLLM KV cache initially so the first critic forward pass has room.
+            # Free trained-agent vLLM KV cache before initializing the colocated
+            # partner — otherwise three engines compete for memory on the same GPU.
             for agent_key in self.checkpoint_managers:
                 self.checkpoint_managers[agent_key].sleep_replicas()
+
+            if self._partner_ckpt_dir:
+                self.async_rollout_managers[PROBE_PARTNER_KEY] = AgentLoopManager.create(
+                    config=self.config,
+                    worker_group=self.actor_rollout_wgs[PROBE_PARTNER_KEY],
+                    rollout_resource_pool=None,
+                    reward_loop_worker_handles=None,
+                    teacher_model_manager=None,
+                    agent_index=PROBE_PARTNER_AGENT_INDEX,
+                )
+                self.checkpoint_managers[PROBE_PARTNER_KEY] = CheckpointEngineManager(
+                    config=checkpoint_engine_config,
+                    trainer=self.actor_rollout_wgs[PROBE_PARTNER_KEY],
+                    replicas=self.async_rollout_managers[PROBE_PARTNER_KEY].rollout_replicas,
+                )
+                # Push partner LoRA weights from FSDP to vLLM once. The partner is
+                # frozen, so we never call update_weights on it again. Sleep right
+                # after so the next training step starts with all engines asleep.
+                self.checkpoint_managers[PROBE_PARTNER_KEY].update_weights(0)
+                self.checkpoint_managers[PROBE_PARTNER_KEY].sleep_replicas()
 
     # multi-agent
     def _save_checkpoint(self):
@@ -1253,11 +1309,7 @@ class RayMAPPOTrainer:
             self.actor_rollout_wgs[f"model_{i}"].load_checkpoint(
                 agent_local_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
-        if getattr(self, "_partner_ckpt_dir", None):
-            partner_actor_path = os.path.join(self._partner_ckpt_dir, "actor", "0")
-            self.actor_rollout_wgs[PROBE_PARTNER_KEY].load_checkpoint(
-                partner_actor_path, del_local_after_load=False
-            )
+        # Partner ckpt is loaded eagerly in init_workers (resume_mode-independent).
         #load critic
         if self.use_critic:
             for i in range(num_agents):
@@ -2000,8 +2052,6 @@ class RayMAPPOTrainer:
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._multi_agent_validate()
-                        probe_metrics = self._run_cross_pair_probe()
-                        val_metrics.update(probe_metrics)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
@@ -2479,8 +2529,6 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._multi_agent_validate()
-                        probe_metrics = self._run_cross_pair_probe()
-                        val_metrics.update(probe_metrics)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)

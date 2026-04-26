@@ -42,11 +42,21 @@ multi_agent:
   # the reciprocal of algorithm.kl_ctrl.kl_coef.
   adversary_kl_to_hero: false
 
-  # Cross-pair probe: at validation cadence, swap one trained agent for a frozen
-  # partner loaded from this checkpoint dir. Empty disables the probe.
+  # Cross-pair probe: load a frozen partner from `partner_ckpt_dir` and run
+  # rollouts that swap it in for one of the trained agents. The probe is now
+  # OFFLINE — it never runs inside the training loop. Invoke via:
+  #   python -m verl.trainer.main_mappo \
+  #     +multi_agent.cross_pair_probe.run_only=true \
+  #     multi_agent.cross_pair_probe.partner_ckpt_dir=<sibling-arm>/global_step_N \
+  #     multi_agent.cross_pair_probe.out_path=logs/probe_step_N.json \
+  #     trainer.resume_mode=resume_path \
+  #     trainer.resume_from_path=<this-arm>/global_step_N \
+  #     <all other training overrides...>
   cross_pair_probe:
     partner_ckpt_dir: ""
     every_n_val_steps: 1
+    run_only: false
+    out_path: ""
 
   # Per-agent resource and model overrides.
   # Length must equal num_agents. Each entry can override actor.model.path,
