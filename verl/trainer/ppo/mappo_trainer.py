@@ -457,9 +457,9 @@ class RayMAPPOTrainer:
         rollout_records = {}
         for batch_idx, batch_tuple in enumerate(zip(*(self.val_dataloaders[k] for k in agent_keys))):
             batch_size = len(DataProto.from_single_dict(batch_tuple[0]))
-            histories=[""]*batch_size
+            self_history = [[""] * batch_size for _ in range(num_agents)]
             for r in range(num_rounds):
-                this_round = [""] * batch_size
+                this_round_responses = [[""] * batch_size for _ in range(num_agents)]
                 for agent_idx,agent_key in enumerate(agent_keys):
                     sample_inputs = sample_inputs_lsts[r][agent_idx]
                     sample_uids = sample_uids_lsts[r][agent_idx]
@@ -471,13 +471,19 @@ class RayMAPPOTrainer:
                     reward_extra_infos_dict=reward_extra_info_list[r][agent_idx]
                     test_batch: DataProto = DataProto.from_single_dict(batch_dict)
                     questions, _ =self._extract_prompts_and_questions(test_batch,agent_key)
-                    chat_prompts=[]
-                    if r==0:
-                        chat_prompts=questions
-                    if r>0:
-                        system_prompt="You are Qwen, created by Alibaba Cloud. You are a helpful assistant. Please collaborate with the other agent to help the user. Provide a well−reasoned response that not only considers your own previous solution but also takes into account answers from other agents. If you believe your previous answer was incorrect, feel free to revise it. Ensure that your explanation clearly justifies your final answer. Please maintain your answer with very simple reasoning."
-                        discussion_prompt=f"The discussion history is as follows: "
-                        chat_prompts = self._build_input_ids_from_histories(system_prompt,discussion_prompt,questions,histories,test_batch,agent_key,max_history_tokens=4096)
+                    if r == 0:
+                        chat_prompts = questions
+                    else:
+                        peer_idx = 1 - agent_idx
+                        chat_prompts = self._build_input_ids_from_histories(
+                            questions=questions,
+                            self_history=self_history[agent_idx],
+                            peer_history=self_history[peer_idx],
+                            r=r,
+                            batch=test_batch,
+                            agent_key=agent_key,
+                            max_history_tokens=4096,
+                        )
                     if "uid" not in test_batch.non_tensor_batch:
                         test_batch.non_tensor_batch["uid"] = np.array(
                             [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
@@ -519,10 +525,7 @@ class RayMAPPOTrainer:
 
                     output_ids = test_output_gen_batch.batch["responses"]
                     output_texts = [self.tokenizers[agent_key].decode(ids, skip_special_tokens=True) for ids in output_ids]
-                    this_round = [
-                        old + f"\nAgent {agent_idx}: {new}" 
-                        for old, new in zip(this_round, output_texts)
-                    ]
+                    this_round_responses[agent_idx] = list(output_texts)
                     sample_outputs.extend(output_texts)
 
                     test_batch = test_batch.union(test_output_gen_batch)
@@ -577,12 +580,10 @@ class RayMAPPOTrainer:
                             data_source=data_source,
                         )
 
-                histories[:] = [
-                    f"[Last round]: {new}"
-                    for new in this_round
-                ]
+                for a in range(num_agents):
+                    self_history[a] = this_round_responses[a]
                 if r==num_rounds-1:
-                    print(histories[0])
+                    print(self_history[0][0] if self_history[0] else "")
         for r in range(num_rounds):
             for agent_idx,agent_key in enumerate(agent_keys):
                 sample_inputs = sample_inputs_lsts[r][agent_idx]
@@ -1127,14 +1128,41 @@ class RayMAPPOTrainer:
             .replace("{peer_prev}", peer_prev)
         )
 
-    def _build_input_ids_from_histories(self,system_prompt,discussion_prompt,questions,histories,batch:DataProto,agent_key,max_history_tokens):
+    def _build_input_ids_from_histories(
+        self,
+        questions,
+        self_history,
+        peer_history,
+        r: int,
+        batch: DataProto,
+        agent_key,
+        max_history_tokens,
+        system_prompt: str | None = None,
+        discussion_prompt_template: str | None = None,
+    ):
+        """Build per-sample chat prompts using the slot-structured template.
+
+        For r >= 1, fills {r}, {self_prev}, {peer_prev} via _format_discussion_prompt.
+        For r == 0, callers should not invoke this method (use the no-history path).
+        """
+        ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
+        if system_prompt is None:
+            system_prompt = ma.get("system_prompt", "")
+        if discussion_prompt_template is None:
+            discussion_prompt_template = ma.get("discussion_prompt_template", "")
+
         prompts = [
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": q},
-                {"role": "user","content": discussion_prompt+hist}
+                {
+                    "role": "user",
+                    "content": self._format_discussion_prompt(
+                        discussion_prompt_template, r, self_prev, peer_prev
+                    ),
+                },
             ]
-            for q,hist in zip(questions,histories)
+            for q, self_prev, peer_prev in zip(questions, self_history, peer_history)
         ]
         tokenizer=self.tokenizers[agent_key]
         raw_prompts = [
@@ -1212,16 +1240,22 @@ class RayMAPPOTrainer:
         batch.non_tensor_batch.pop("raw_prompt_ids", None)
         return raw_prompts
 
-    def _single_agent_rollout(self, agent_idx, agent_key, batch_dict, histories, r, round_agent_metrics):
+    def _single_agent_rollout(self, agent_idx, agent_key, batch_dict, self_history, peer_history, r, round_agent_metrics):
         # Per-agent bookkeeping and metrics
         metrics=round_agent_metrics[r][agent_idx]
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         # if not the first round
-        if r>0:
-            questions, _ =self._extract_prompts_and_questions(batch,agent_key)
-            system_prompt="You are Qwen, created by Alibaba Cloud. You are a helpful assistant. Please collaborate with the other agent to help the user. "
-            discussion_prompt=f"The discussion history is as follows:"
-            chat_prompts=self._build_input_ids_from_histories(system_prompt,discussion_prompt,questions,histories,batch,agent_key,max_history_tokens=4096)
+        if r > 0:
+            questions, _ = self._extract_prompts_and_questions(batch, agent_key)
+            chat_prompts = self._build_input_ids_from_histories(
+                questions=questions,
+                self_history=self_history,
+                peer_history=peer_history,
+                r=r,
+                batch=batch,
+                agent_key=agent_key,
+                max_history_tokens=4096,
+            )
         # add uid to batch
         if "uid" not in batch.non_tensor_batch:
             batch.non_tensor_batch["uid"] = np.array(
@@ -1564,7 +1598,7 @@ class RayMAPPOTrainer:
 
                 # discussion setting
                 batch_size=self.config.data.train_batch_size
-                histories=[""]*batch_size
+                self_history = [[""] * batch_size for _ in range(num_agents)]
                 # rollout
                 for r in range(num_rounds):
                     # Engines were put to sleep after each round's generate. Wake them
@@ -1572,35 +1606,34 @@ class RayMAPPOTrainer:
                     if r > 0 and self.async_rollout_mode:
                         for agent_key in agent_keys:
                             self.checkpoint_managers[agent_key].wake_up_replicas()
-                    this_round = [""] * batch_size
                     from concurrent.futures import ThreadPoolExecutor
                     futures = []
                     with ThreadPoolExecutor(max_workers=num_agents) as executor:
                         for agent_idx, agent_key in enumerate(agent_keys):
                             batch_dict = batch_tuple[agent_idx]
+                            peer_idx = 1 - agent_idx
                             futures.append(
                                 executor.submit(
                                     self._single_agent_rollout,
                                     agent_idx,
                                     agent_key,
                                     batch_dict,
-                                    histories,
+                                    self_history[agent_idx],
+                                    self_history[peer_idx],
                                     r,
                                     round_agent_metrics,
                                 )
                             )
                     results = [f.result() for f in futures]
+                    this_round_responses = [[""] * batch_size for _ in range(num_agents)]
                     for agent_idx, (resp_texts, batch, agent_timing) in enumerate(results):
-                        this_round = [
-                            old + f"\nAgent {agent_idx}: {new}"
-                            for old, new in zip(this_round, resp_texts)
-                        ]
+                        this_round_responses[agent_idx] = list(resp_texts)
                         round_agent_batches[r][agent_idx] = batch
                         round_agent_timings[r][agent_idx] = agent_timing
                         if "step" in agent_timing:
                             step_durations.append(agent_timing["step"])
-                    
-                    histories[:] = [f"[Last round]: {new}" for new in this_round]
+                    for a in range(num_agents):
+                        self_history[a] = this_round_responses[a]
 
                 # backpropagate reward
                 self.back_propogate_reward(num_rounds,num_agents,round_agent_batches,gamma=1)
@@ -1773,10 +1806,6 @@ class RayMAPPOTrainer:
 class RayRiskAverseTrainer(RayMAPPOTrainer):
     """MAPPO variant with shared discussion prompts and an adversarial agent."""
 
-    def _shared_discussion_prompt(self) -> str:
-        """Use a unified discussion prompt for all agents."""
-        ma = OmegaConf.select(self.config, "multi_agent", default={}) or {}
-        return ma.get("discussion_prompt", "The discussion history is as follows:")
     def _apply_kl_penalty(
         self,
         adv_data: DataProto,
@@ -1845,21 +1874,6 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
             "actor/reward_kl_penalty_coeff": beta,
         }
         return adv_data, metrics
-    def _build_input_ids_from_histories(
-        self,
-        system_prompt,
-        discussion_prompt,
-        questions,
-        histories,
-        batch: DataProto,
-        agent_key,
-        max_history_tokens,
-    ):
-        shared_prompt = self._shared_discussion_prompt()
-        return super()._build_input_ids_from_histories(
-            system_prompt, shared_prompt, questions, histories, batch, agent_key, max_history_tokens
-        )
-
     def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
         """Propagate rewards with adversarial back-prop.
 
@@ -1992,40 +2006,40 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                 step_durations = []
 
                 batch_size = self.config.data.train_batch_size
-                histories = [""] * batch_size
+                self_history = [[""] * batch_size for _ in range(num_agents)]
                 for r in range(num_rounds):
                     if r > 0 and self.async_rollout_mode:
                         for agent_key in agent_keys:
                             self.checkpoint_managers[agent_key].wake_up_replicas()
-                    this_round = [""] * batch_size
                     from concurrent.futures import ThreadPoolExecutor
 
                     futures = []
                     with ThreadPoolExecutor(max_workers=num_agents) as executor:
                         for agent_idx, agent_key in enumerate(agent_keys):
                             batch_dict = batch_tuple[agent_idx]
+                            peer_idx = 1 - agent_idx
                             futures.append(
                                 executor.submit(
                                     self._single_agent_rollout,
                                     agent_idx,
                                     agent_key,
                                     batch_dict,
-                                    histories,
+                                    self_history[agent_idx],
+                                    self_history[peer_idx],
                                     r,
                                     round_agent_metrics,
                                 )
                             )
                     results = [f.result() for f in futures]
+                    this_round_responses = [[""] * batch_size for _ in range(num_agents)]
                     for agent_idx, (resp_texts, batch, agent_timing) in enumerate(results):
-                        this_round = [
-                            old + f"\nAgent {agent_idx}: {new}" for old, new in zip(this_round, resp_texts)
-                        ]
+                        this_round_responses[agent_idx] = list(resp_texts)
                         round_agent_batches[r][agent_idx] = batch
                         round_agent_timings[r][agent_idx] = agent_timing
                         if "step" in agent_timing:
                             step_durations.append(agent_timing["step"])
-
-                    histories[:] = [f"[Last round]: {new}" for new in this_round]
+                    for a in range(num_agents):
+                        self_history[a] = this_round_responses[a]
                 # Agent 0 = adversary, Agent 1 = hero (risk-averse).
                 # back_propogate_reward (overridden in this class) applies cross-round
                 # adversarial discounting; the SRPO regularizer below optionally
