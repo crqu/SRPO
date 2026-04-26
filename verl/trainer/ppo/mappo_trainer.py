@@ -62,6 +62,96 @@ import verl.utils.torch_functional as verl_F
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_advantage, compute_response_mask
 
 
+def _extract_final_answer(text: str) -> str | None:
+    """Return the substring after the last '####', stripped. None if marker absent."""
+    if "####" not in text:
+        return None
+    return text.rsplit("####", 1)[1].strip()
+
+
+def _compute_cheap_diagnostics(
+    num_rounds: int,
+    num_agents: int,
+    correctness: dict,
+    responses: dict,
+    response_lens: dict,
+) -> dict:
+    """Compute the §6.1 metric block from already-rolled-out per-round per-agent data.
+
+    Args:
+        num_rounds: number of debate rounds
+        num_agents: number of agents (2 for this spec)
+        correctness: dict[r][a] -> np.ndarray[B] of {0,1}
+        responses: dict[r][a] -> list[str] of length B (decoded text)
+        response_lens: dict[r][a] -> np.ndarray[B] of int (response token counts)
+
+    Returns:
+        Flat dict of metric_key -> float value, using the keys defined in spec §6.1.
+        Round-0 conditional metrics (hero_recovery, corrupted_by_debate, answer_flip)
+        are emitted only for r >= 1.
+    """
+    import numpy as np
+
+    metrics: dict = {}
+
+    answers = {
+        r: {a: [_extract_final_answer(t) for t in responses[r][a]] for a in range(num_agents)}
+        for r in range(num_rounds)
+    }
+
+    for r in range(num_rounds):
+        for a in range(num_agents):
+            metrics[f"accuracy/round_{r}/agent_{a}"] = float(correctness[r][a].mean())
+
+        agree = [
+            (ans0 is not None and ans1 is not None and ans0 == ans1)
+            for ans0, ans1 in zip(answers[r][0], answers[r][1])
+        ]
+        metrics[f"agreement_rate/round_{r}"] = float(np.mean(agree)) if agree else 0.0
+
+        for a in range(num_agents):
+            lens = response_lens[r][a]
+            metrics[f"response_len/agent_{a}/round_{r}/mean"] = float(lens.mean())
+            metrics[f"response_len/agent_{a}/round_{r}/p50"] = float(np.percentile(lens, 50))
+            metrics[f"response_len/agent_{a}/round_{r}/p95"] = float(np.percentile(lens, 95))
+
+        for a in range(num_agents):
+            rates = []
+            for text in responses[r][a]:
+                tokens = text.split()
+                if len(tokens) < 4:
+                    rates.append(0.0)
+                    continue
+                grams = [tuple(tokens[i:i + 4]) for i in range(len(tokens) - 3)]
+                if not grams:
+                    rates.append(0.0)
+                    continue
+                unique = len(set(grams))
+                rates.append(1.0 - unique / len(grams))
+            metrics[f"repetition_4gram/agent_{a}/round_{r}"] = float(np.mean(rates)) if rates else 0.0
+
+        if r == 0:
+            continue
+
+        prev_a1 = correctness[r - 1][1]
+        curr_a1 = correctness[r][1]
+        recovered = ((prev_a1 == 0) & (curr_a1 == 1)).astype(float)
+        metrics[f"hero_recovery_rate/round_{r}"] = float(recovered.mean())
+
+        for a in range(num_agents):
+            prev = correctness[r - 1][a]
+            curr = correctness[r][a]
+            corrupted = ((prev == 1) & (curr == 0)).astype(float)
+            metrics[f"corrupted_by_debate/round_{r}/agent_{a}"] = float(corrupted.mean())
+
+            prev_ans = answers[r - 1][a]
+            curr_ans = answers[r][a]
+            flips = [pa != ca for pa, ca in zip(prev_ans, curr_ans)]
+            metrics[f"answer_flip_rate/round_{r}/agent_{a}"] = float(np.mean(flips)) if flips else 0.0
+
+    return metrics
+
+
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
     """Create a dataset for a single agent.
 
@@ -1599,6 +1689,7 @@ class RayMAPPOTrainer:
                 # discussion setting
                 batch_size=self.config.data.train_batch_size
                 self_history = [[""] * batch_size for _ in range(num_agents)]
+                round_agent_responses = [["" for _ in range(num_agents)] for _ in range(num_rounds)]
                 # rollout
                 for r in range(num_rounds):
                     # Engines were put to sleep after each round's generate. Wake them
@@ -1630,10 +1721,38 @@ class RayMAPPOTrainer:
                         this_round_responses[agent_idx] = list(resp_texts)
                         round_agent_batches[r][agent_idx] = batch
                         round_agent_timings[r][agent_idx] = agent_timing
+                        round_agent_responses[r][agent_idx] = list(resp_texts)
                         if "step" in agent_timing:
                             step_durations.append(agent_timing["step"])
                     for a in range(num_agents):
                         self_history[a] = this_round_responses[a]
+
+                # cheap training-step diagnostics (spec §6.1)
+                diag_correctness = {
+                    r: {
+                        a: round_agent_batches[r][a].batch["token_level_scores"].sum(-1).cpu().numpy()
+                        for a in range(num_agents)
+                    }
+                    for r in range(num_rounds)
+                }
+                for r in range(num_rounds):
+                    for a in range(num_agents):
+                        diag_correctness[r][a] = (diag_correctness[r][a] > 0.5).astype("int64")
+                diag_response_lens = {
+                    r: {
+                        a: round_agent_batches[r][a].batch["response_mask"].sum(-1).cpu().numpy()
+                        for a in range(num_agents)
+                    }
+                    for r in range(num_rounds)
+                }
+                diag_metrics = _compute_cheap_diagnostics(
+                    num_rounds=num_rounds,
+                    num_agents=num_agents,
+                    correctness=diag_correctness,
+                    responses=round_agent_responses,
+                    response_lens=diag_response_lens,
+                )
+                metrics.update({f"train/{k}": v for k, v in diag_metrics.items()})
 
                 # backpropagate reward
                 self.back_propogate_reward(num_rounds,num_agents,round_agent_batches,gamma=1)
@@ -2007,6 +2126,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
                 batch_size = self.config.data.train_batch_size
                 self_history = [[""] * batch_size for _ in range(num_agents)]
+                round_agent_responses = [["" for _ in range(num_agents)] for _ in range(num_rounds)]
                 for r in range(num_rounds):
                     if r > 0 and self.async_rollout_mode:
                         for agent_key in agent_keys:
@@ -2036,10 +2156,39 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                         this_round_responses[agent_idx] = list(resp_texts)
                         round_agent_batches[r][agent_idx] = batch
                         round_agent_timings[r][agent_idx] = agent_timing
+                        round_agent_responses[r][agent_idx] = list(resp_texts)
                         if "step" in agent_timing:
                             step_durations.append(agent_timing["step"])
                     for a in range(num_agents):
                         self_history[a] = this_round_responses[a]
+
+                # cheap training-step diagnostics (spec §6.1)
+                diag_correctness = {
+                    r: {
+                        a: round_agent_batches[r][a].batch["token_level_scores"].sum(-1).cpu().numpy()
+                        for a in range(num_agents)
+                    }
+                    for r in range(num_rounds)
+                }
+                for r in range(num_rounds):
+                    for a in range(num_agents):
+                        diag_correctness[r][a] = (diag_correctness[r][a] > 0.5).astype("int64")
+                diag_response_lens = {
+                    r: {
+                        a: round_agent_batches[r][a].batch["response_mask"].sum(-1).cpu().numpy()
+                        for a in range(num_agents)
+                    }
+                    for r in range(num_rounds)
+                }
+                diag_metrics = _compute_cheap_diagnostics(
+                    num_rounds=num_rounds,
+                    num_agents=num_agents,
+                    correctness=diag_correctness,
+                    responses=round_agent_responses,
+                    response_lens=diag_response_lens,
+                )
+                metrics.update({f"train/{k}": v for k, v in diag_metrics.items()})
+
                 # Agent 0 = adversary, Agent 1 = hero (risk-averse).
                 # back_propogate_reward (overridden in this class) applies cross-round
                 # adversarial discounting; the SRPO regularizer below optionally
