@@ -874,6 +874,33 @@ class RayMAPPOTrainer:
 
         return out
 
+    def run_offline_probe(self, out_path: str | None = None) -> dict:
+        """Load the trained-arm checkpoint, sync it into vLLM, run the probe, dump.
+
+        Public entry for the cross-pair probe when invoked outside the training
+        loop. Trained-agent vLLMs end `init_workers` asleep with base-model
+        weights; without an explicit `update_weights`, the probe would generate
+        from the wrong policy. We mirror what `mappo_fit`'s first iteration does.
+        """
+        assert getattr(self, "_partner_ckpt_dir", None), (
+            "run_offline_probe requires multi_agent.cross_pair_probe.partner_ckpt_dir"
+        )
+        self._load_checkpoint()
+        if self.async_rollout_mode:
+            for agent_key in self.actor_rollout_wgs:
+                if agent_key == PROBE_PARTNER_KEY:
+                    continue
+                self.checkpoint_managers[agent_key].update_weights(self.global_steps)
+        metrics = self._run_cross_pair_probe()
+        payload = {"global_steps": self.global_steps, **metrics}
+        if out_path:
+            dirname = os.path.dirname(os.path.abspath(out_path))
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2)
+        return payload
+
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -1309,7 +1336,6 @@ class RayMAPPOTrainer:
             self.actor_rollout_wgs[f"model_{i}"].load_checkpoint(
                 agent_local_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
-        # Partner ckpt is loaded eagerly in init_workers (resume_mode-independent).
         #load critic
         if self.use_critic:
             for i in range(num_agents):
