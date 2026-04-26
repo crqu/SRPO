@@ -67,7 +67,7 @@ The adversary's role in SRPO is to model the worst-case partner the hero could f
 
 ### System prompt — neutral, identical across both agents and all three arms
 
-> *"You are solving a math word problem with one peer. In each round, you will see the question, your previous response, and your peer's previous response. Reason step by step. Where your peer's reasoning is sound, incorporate it; where it is flawed, identify the flaw and revise. End your response with a single line `Final answer: <number>`."*
+> *"You are solving a math word problem with one peer. In each round, you will see the question, your previous response, and your peer's previous response. Reason step by step. Where your peer's reasoning is sound, incorporate it; where it is flawed, identify the flaw and revise. Output the final answer after "####"."*
 
 Properties:
 - No "collaborate" framing (fixes Section 2 bug).
@@ -139,17 +139,31 @@ All metrics emitted from rollouts the trainer already produces. Logged under `tr
 
 Implementation point: a single helper `_compute_cheap_diagnostics(round_agent_batches)` is called per training step after rollouts complete and emits the full block.
 
-### 6.2 Cross-pair probe at validation cadence
+### 6.2 Cross-pair probe (offline, on saved checkpoints)
 
-At trainer init, if `multi_agent.cross_pair_probe.partner_ckpt_dir` is non-empty, instantiate a third actor worker group `probe_partner` from that checkpoint. The partner is loaded once and never updated; reuses the existing `actor_rollout_wgs` machinery so no new worker class is required.
+The probe runs **outside** the training loop, as a separate Hydra invocation against a pair of saved checkpoints. This avoids paying the 3-engine GPU memory tax during training (a third vLLM colocates with `agent_0` and forces `gpu_memory_utilization` down — see `project_cross_pair_probe_rewire` memory). The probe code path is the same `_run_cross_pair_probe()` method in `mappo_trainer.py`; only the trigger differs.
 
-For each `srpo_*` arm, the probe partner is the frozen `ippo` checkpoint at the same `global_step`. For the `ippo` arm, the probe partner is the frozen `srpo_main` checkpoint. If the sibling arm has not yet produced a checkpoint at the matching step, all `cross_pair/*` metrics are emitted as `nan` for that step — no error.
+**Invocation** (from `train_q05b.slurm` header comment):
 
-Probe rollout: identical to normal validation, except:
-- **Direction A:** trained agent_0 paired with `probe_partner` as agent_1.
-- **Direction B:** `probe_partner` as agent_0 paired with trained agent_1.
+```bash
+python -m verl.trainer.main_mappo \
+  +multi_agent.cross_pair_probe.run_only=true \
+  multi_agent.cross_pair_probe.partner_ckpt_dir=<sibling-arm>/global_step_N \
+  multi_agent.cross_pair_probe.out_path=logs/probe_<method>_step_N.json \
+  trainer.resume_mode=resume_path \
+  trainer.resume_from_path=<this-arm>/global_step_N \
+  <all other config args matching the training script>
+```
 
-Both directions run on the same val set used for normal validation.
+`TaskRunner.run` checks `cross_pair_probe.run_only`; when true it skips `mappo_fit`, calls `_load_checkpoint()` (loads the trained arm via `resume_from_path`) plus the partner via `partner_ckpt_dir`, runs `_run_cross_pair_probe()` once, dumps a JSON to `out_path`, and exits.
+
+**Pairing convention.** For each `srpo_*` arm, the probe partner is the frozen `ippo` checkpoint at the same `global_step`. For the `ippo` arm, the probe partner is the frozen `srpo_main` checkpoint. If the sibling arm has not yet produced a checkpoint at the matching step, the probe is simply not invoked for that step — there is no in-training fallback to emit `nan`s.
+
+**Probe rollout** (identical to normal validation, except for the partner swap):
+- **Direction A (`srpo_first`):** trained agent_0 paired with `probe_partner` as agent_1.
+- **Direction B (`srpo_second`):** `probe_partner` as agent_0 paired with trained agent_1.
+
+Both directions run on one batch of the val set; uncomment the `break` in `_run_cross_pair_probe` for full enumeration.
 
 | Metric key | Definition |
 |---|---|
@@ -158,6 +172,8 @@ Both directions run on the same val set used for normal validation.
 | `cross_pair/<metric>/{direction}/round_{r}` | All Section 6.1 metrics replayed under cross-pair |
 
 `{direction}` is either `srpo_first` (trained agent at index 0, partner at 1) or `srpo_second` (partner at 0, trained agent at 1). Logging both directions hedges against position bias in the debate format.
+
+**Operational note.** A small driver script that walks both arms' `checkpoints/.../global_step_*` directories and invokes the probe for every matched step is the natural follow-up; it isn't part of this spec because the probe entry point alone is the load-bearing primitive.
 
 ### 6.3 What's deliberately deferred
 
@@ -172,11 +188,12 @@ These extensions are all single-config-flag additions on top of the cross-pair p
 
 | File | Change |
 |---|---|
-| `verl/trainer/config/mappo_trainer.yaml` | Add `multi_agent.system_prompt`, `multi_agent.discussion_prompt_template`, `multi_agent.cross_pair_probe.partner_ckpt_dir` (default empty), `multi_agent.cross_pair_probe.every_n_val_steps` (default 1). |
-| `verl/trainer/ppo/mappo_trainer.py` | (1) Replace inline `system_prompt=` and `discussion_prompt=` strings at `:478-480` and `:1208-1210` with config reads. (2) `_build_input_ids_from_histories` and `_build_input_ids_adversary` accept self/peer histories and apply the new template. (3) History bookkeeping at `:522-525`, `:580-581`, `:1589`, `:2014` switches from a single shared `histories` list to per-agent `self_history` and `peer_history`. (4) Add `_compute_cheap_diagnostics(round_agent_batches)` invoked per training step. (5) Add `_run_cross_pair_probe()` invoked at validation cadence; lazy-init of `probe_partner` actor wg from `partner_ckpt_dir` at trainer init. |
-| `debug_q05b_local.sh`, `train_q05b.slurm` | Extend `METHOD` switch to `{ippo, srpo_main, srpo_reward_only}`. For `srpo_main` only, append `multi_agent.agents.0.actor.actor.entropy_coeff=0.05`. For all three arms, append `multi_agent.cross_pair_probe.partner_ckpt_dir=<sibling-arm-ckpt-dir>` (resolved per arm). |
+| `verl/trainer/config/mappo_trainer.yaml` | Add `multi_agent.system_prompt`, `multi_agent.discussion_prompt_template`, `multi_agent.cross_pair_probe.{partner_ckpt_dir, every_n_val_steps, run_only, out_path}` (all defaulting to disabled / empty). |
+| `verl/trainer/ppo/mappo_trainer.py` | (1) Replace inline `system_prompt=` and `discussion_prompt=` strings at `:478-480` and `:1208-1210` with config reads. (2) `_build_input_ids_from_histories` and `_build_input_ids_adversary` accept self/peer histories and apply the new template. (3) History bookkeeping at `:522-525`, `:580-581`, `:1589`, `:2014` switches from a single shared `histories` list to per-agent `self_history` and `peer_history`. (4) Add `_compute_cheap_diagnostics(round_agent_batches)` invoked per training step. (5) Add `_run_cross_pair_probe()` for offline use; lazy-init of `probe_partner` actor wg + AgentLoopManager + CheckpointEngineManager from `partner_ckpt_dir` at trainer init, gated on the dir being non-empty. The probe is **not** called from `mappo_fit`. |
+| `verl/trainer/main_mappo.py` | `TaskRunner.run` checks `multi_agent.cross_pair_probe.run_only`; when true, skips `mappo_fit` and runs probe-only flow (load trained-arm checkpoint via `resume_from_path`, call `_run_cross_pair_probe`, dump JSON to `out_path`, exit). |
+| `debug_q05b_local.sh`, `train_q05b.slurm` | Extend `METHOD` switch to `{ippo, srpo_main, srpo_reward_only}`. For `srpo_main` only, append `multi_agent.agents.0.actor.actor.entropy_coeff=0.05`. Cross-pair probe is invoked separately on saved checkpoints — see slurm header for the CLI form. |
 
-Files **not** modified: `verl/trainer/main_mappo.py`, `verl/trainer/ppo/core_algos.py`, `verl/trainer/ppo/reward.py`, `back_propogate_reward`, `_apply_kl_penalty`.
+Files **not** modified: `verl/trainer/ppo/core_algos.py`, `verl/trainer/ppo/reward.py`, `back_propogate_reward`, `_apply_kl_penalty`.
 
 ## 8. Tests
 
@@ -192,10 +209,11 @@ Before committing compute to a full run:
 
 1. All three unit tests pass on CPU.
 2. `METHOD=ippo bash debug_q05b_local.sh` (2 steps, `trainer.save_freq=1` for the smoke run so a checkpoint lands at step 2): checkpoint exists; Section 6.1 metric keys appear in console output.
-3. `METHOD=srpo_main bash debug_q05b_local.sh` (2 steps) with `partner_ckpt_dir` pointed at the IPPO checkpoint from step 2: `cross_pair/*` keys present in console output; `kl_adv_to_hero/mean > 0`; `entropy/adv_minus_hero > 0`.
-4. `METHOD=srpo_reward_only bash debug_q05b_local.sh` (2 steps): `entropy/adv_minus_hero ≈ 0` (within sampling noise).
+3. `METHOD=srpo_main bash debug_q05b_local.sh` (2 steps): training succeeds; `actor/reward_kl_penalty > 0` for agent 0 (the SRPO adversary regularizer is firing); agent 0 entropy drifts upward of agent 1 over rounds (5× ε ratio).
+4. `METHOD=srpo_reward_only bash debug_q05b_local.sh` (2 steps): training succeeds; agent-0 vs agent-1 entropy ≈ symmetric within sampling noise.
+5. **Offline cross-pair probe** invoked against the IPPO step-2 checkpoint paired with the SRPO main step-2 checkpoint (and vice versa): the probe Hydra app exits 0 and writes a JSON file containing `cross_pair/joint_acc/srpo_first` and `cross_pair/joint_acc/srpo_second` keys, plus the cheap-diagnostic block under both directions.
 
-Only after all four pass do we launch the full Q0.5B 200-step × 2-seed × 3-arm run.
+Only after all five pass do we launch the full Q0.5B 200-step × 2-seed × 3-arm run.
 
 ## 10. Success criteria for this spec
 

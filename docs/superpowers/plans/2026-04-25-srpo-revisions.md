@@ -1419,45 +1419,73 @@ Run: `METHOD=ippo bash debug_q05b_local.sh` after temporarily editing the script
 
 If save_freq=1 is awkward to inject, edit the script's `trainer.save_freq=50` to `trainer.save_freq=1` for this verification run; revert before commit.
 
-- [ ] **Step 8.3: SRPO main smoke run produces cross_pair metrics and entropy gap**
+- [ ] **Step 8.3: SRPO main smoke run produces SRPO regularizer + entropy gap**
 
 Run:
 
 ```bash
-PARTNER_CKPT_DIR=$(realpath checkpoints/ippo_q05b_dbg/global_step_2) \
-    METHOD=srpo_main \
-    bash debug_q05b_local.sh
+METHOD=srpo_main bash debug_q05b_local.sh
 ```
 
-Expected:
-- Console contains `cross_pair/joint_acc/srpo_first` and `cross_pair/joint_acc/srpo_second` keys.
-- `train/kl_adv_to_hero/mean` strictly positive (not 0, not NaN).
-- `train/entropy/agent_0` > `train/entropy/agent_1` by a margin consistent with the 5x ε ratio.
+Expected (training-only; cross_pair is verified in Step 8.5):
+- `actor/reward_kl_penalty` for agent 0 strictly positive (not 0, not NaN) — adversary KL-to-hero is firing.
+- `actor/entropy` for agent 0 trends above agent 1 across rounds (consistent with 5× ε ratio); margin will be small at 2 steps.
 - Exit code 0.
+- `checkpoints/srpo_main_q05b_dbg/global_step_2/` directory exists.
 
 - [ ] **Step 8.4: SRPO reward-only smoke run shows ≈ symmetric entropy**
 
 Run:
 
 ```bash
-PARTNER_CKPT_DIR=$(realpath checkpoints/ippo_q05b_dbg/global_step_2) \
-    METHOD=srpo_reward_only \
-    bash debug_q05b_local.sh
+METHOD=srpo_reward_only bash debug_q05b_local.sh
 ```
 
 Expected:
-- `train/entropy/agent_0` ≈ `train/entropy/agent_1` (within sampling noise, since both ε=0.01).
-- `cross_pair/*` keys still present.
+- `actor/entropy/agent_0` ≈ `actor/entropy/agent_1` (within sampling noise, since both ε=0.01).
+- `actor/reward_kl_penalty` for agent 0 strictly positive (still firing — `adversary_kl_to_hero=true` in this arm).
 - Exit code 0.
+- `checkpoints/srpo_reward_only_q05b_dbg/global_step_2/` directory exists.
 
-- [ ] **Step 8.5: Spec-success record**
+- [ ] **Step 8.5: Offline cross-pair probe produces metric file**
 
-If all four steps pass, the spec is implementation-complete. Add a one-line entry to the bottom of `docs/superpowers/specs/2026-04-25-srpo-revisions-design.md` under a new heading:
+The cross-pair probe is invoked separately on saved checkpoints (spec §6.2 — moved out of the training loop to avoid the 3-engine GPU memory tax). Run it once for each direction. Use the same env as the training script:
+
+```bash
+mkdir -p logs/probes
+
+# Probe srpo_main against the IPPO step-2 checkpoint as partner.
+python -m verl.trainer.main_mappo \
+    +multi_agent.cross_pair_probe.run_only=true \
+    multi_agent.cross_pair_probe.partner_ckpt_dir=$(realpath checkpoints/ippo_q05b_dbg/global_step_2) \
+    multi_agent.cross_pair_probe.out_path=logs/probes/srpo_main_step2.json \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=$(realpath checkpoints/srpo_main_q05b_dbg/global_step_2) \
+    <copy all data.*, multi_agent.*, actor_rollout_ref.*, critic.*, trainer.* args from debug_q05b_local.sh, with METHOD=srpo_main settings>
+
+# Probe ippo against the SRPO main step-2 checkpoint as partner.
+python -m verl.trainer.main_mappo \
+    +multi_agent.cross_pair_probe.run_only=true \
+    multi_agent.cross_pair_probe.partner_ckpt_dir=$(realpath checkpoints/srpo_main_q05b_dbg/global_step_2) \
+    multi_agent.cross_pair_probe.out_path=logs/probes/ippo_step2.json \
+    trainer.resume_mode=resume_path \
+    trainer.resume_from_path=$(realpath checkpoints/ippo_q05b_dbg/global_step_2) \
+    <copy with METHOD=ippo settings>
+```
+
+Expected for each probe invocation:
+- Exit code 0.
+- The output JSON exists, parses, and contains `cross_pair/joint_acc/srpo_first`, `cross_pair/joint_acc/srpo_second`, plus the `cross_pair/<diag>/<dir>` block from `_compute_cheap_diagnostics`.
+- `global_steps` field in the JSON equals 2.
+
+- [ ] **Step 8.6: Spec-success record**
+
+If all five steps pass, the spec is implementation-complete. Add a one-line entry to the bottom of `docs/superpowers/specs/2026-04-25-srpo-revisions-design.md` under a new heading:
 
 ```markdown
 ## Implementation status
 
-- 2026-MM-DD: smoke ladder passed on 2-GPU debug node. See `logs/{ippo,srpo_main,srpo_reward_only}_q05b_dbg_*.log`.
+- 2026-MM-DD: smoke ladder (Steps 8.1–8.5) passed on 2-GPU debug node. See `logs/{ippo,srpo_main,srpo_reward_only}_q05b_dbg_*.log` and `logs/probes/*.json`.
 ```
 
 (Use the actual completion date.)
@@ -1481,9 +1509,9 @@ After all tasks:
    - `feat(mappo): cheap training-step diagnostics ...`
    - `feat(mappo): lazy probe_partner actor worker group instantiation + checkpoint load`
    - `feat(mappo): _run_cross_pair_probe ...`
-   - `feat(mappo): wire cross-pair probe into validation cadence`
+   - `feat(mappo): offline cross-pair probe entry point (TaskRunner.run probe-only branch)`
    - `feat(runners): METHOD switch ...`
    - `docs(srpo): record smoke ladder pass ...`
-3. Smoke ladder Steps 8.2-8.4 all completed with the expected metric keys present.
+3. Smoke ladder Steps 8.2-8.5 all completed with the expected metric keys present.
 
 If any step fails: stop, do not paper over with try/except, identify root cause, fix, then re-run from the failing step. Do not skip ahead.
