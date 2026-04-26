@@ -1986,6 +1986,8 @@ class RayMAPPOTrainer:
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._multi_agent_validate()
+                        probe_metrics = self._run_cross_pair_probe()
+                        val_metrics.update(probe_metrics)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
@@ -2461,6 +2463,8 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._multi_agent_validate()
+                        probe_metrics = self._run_cross_pair_probe()
+                        val_metrics.update(probe_metrics)
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
