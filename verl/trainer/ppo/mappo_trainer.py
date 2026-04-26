@@ -917,6 +917,27 @@ class RayMAPPOTrainer:
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
+        # Cross-pair probe partner (spec §6.2). Loaded only if partner_ckpt_dir is set.
+        probe_cfg = OmegaConf.select(self.config, "multi_agent.cross_pair_probe", default={}) or {}
+        partner_ckpt_dir = str(probe_cfg.get("partner_ckpt_dir", "") or "")
+        if partner_ckpt_dir:
+            partner_pool = self.resource_pool_manager.get_resource_pool("agent_pool_0") \
+                or self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            partner_actor_cfg = OmegaConf.merge(
+                deepcopy(self.config.actor_rollout_ref),
+                OmegaConf.select(self.config, "multi_agent.agents.0.actor", default={}) or {},
+            )
+            OmegaConf.update(partner_actor_cfg, "rollout.agent_index", 99, force_add=True)
+            partner_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.ActorRollout],
+                config=partner_actor_cfg,
+                role="actor_rollout",
+            )
+            self.resource_pool_to_cls[partner_pool]["actor_rollout_probe_partner"] = partner_cls
+            self._partner_ckpt_dir = partner_ckpt_dir
+        else:
+            self._partner_ckpt_dir = None
+
         # initialize WorkerGroup
         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
         # you should not use `create_colocated_worker_cls`.
@@ -942,6 +963,11 @@ class RayMAPPOTrainer:
             actor_wg = all_wg[f"actor_rollout_{i}"]
             actor_wg.init_model()
             self.actor_rollout_wgs[f"model_{i}"] = actor_wg
+
+        if self._partner_ckpt_dir:
+            partner_wg = all_wg["actor_rollout_probe_partner"]
+            partner_wg.init_model()
+            self.actor_rollout_wgs["probe_partner"] = partner_wg
 
         self.critic_wgs = {}
         if self.use_critic:
@@ -1113,6 +1139,11 @@ class RayMAPPOTrainer:
             agent_local_path=os.path.join(actor_path, agent_path)
             self.actor_rollout_wgs[f"model_{i}"].load_checkpoint(
                 agent_local_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
+        if getattr(self, "_partner_ckpt_dir", None):
+            partner_actor_path = os.path.join(self._partner_ckpt_dir, "actor", "0")
+            self.actor_rollout_wgs["probe_partner"].load_checkpoint(
+                partner_actor_path, del_local_after_load=False
             )
         #load critic
         if self.use_critic:
