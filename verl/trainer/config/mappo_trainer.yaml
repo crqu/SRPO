@@ -22,8 +22,19 @@ multi_agent:
   # Trainer class: "mappo" for IPPO (RayMAPPOTrainer), "risk_averse" for SRPO (RayRiskAverseTrainer).
   trainer_type: mappo
 
-  # Prompt prepended to discussion history for each agent turn.
-  discussion_prompt: "The discussion history is as follows:"
+  # System prompt prepended to every agent turn. Identical for all agents and arms.
+  # See docs/superpowers/specs/2026-04-25-srpo-revisions-design.md §4.
+  system_prompt: |
+    You are solving a math word problem with one peer. In each round, you will see the question, your previous response, and your peer's previous response. Reason step by step. Where your peer's reasoning is sound, incorporate it; where it is flawed, identify the flaw and revise. Output the final answer after "####".
+
+  # Slot-structured discussion-prompt template used for round r >= 1.
+  # Placeholders: {r}, {self_prev}, {peer_prev}. Substitution uses str.replace,
+  # so literal '{...}' inside agent responses will not crash.
+  discussion_prompt_template: |
+    Round {r}. Below is the previous round of the discussion.
+    - Your previous response: {self_prev}
+    - Peer's previous response: {peer_prev}
+    Now produce your round-{r} response.
 
   # SRPO-only: apply (1/tau) * KL(pi_adv || pi_hero) regularizer to the
   # adversary's token-level reward, evaluated on adversary trajectories with
@@ -31,9 +42,16 @@ multi_agent:
   # the reciprocal of algorithm.kl_ctrl.kl_coef.
   adversary_kl_to_hero: false
 
+  # Cross-pair probe: at validation cadence, swap one trained agent for a frozen
+  # partner loaded from this checkpoint dir. Empty disables the probe.
+  cross_pair_probe:
+    partner_ckpt_dir: ""
+    every_n_val_steps: 1
+
   # Per-agent resource and model overrides.
   # Length must equal num_agents. Each entry can override actor.model.path,
-  # n_gpus_per_node, nnodes, and any actor/critic sub-config.
+  # n_gpus_per_node, nnodes, and any actor/critic sub-config (including
+  # actor.entropy_coeff for the bounded-rationality ablation).
   agents:
     - actor:
         model:
