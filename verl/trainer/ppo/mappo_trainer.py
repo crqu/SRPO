@@ -1112,7 +1112,21 @@ class RayMAPPOTrainer:
         system_prompt = system_prompt.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
         system_prompt = re.sub(r"\s+", " ", system_prompt)
         return questions, system_prompt
-    
+
+    @staticmethod
+    def _format_discussion_prompt(template: str, r: int, self_prev: str, peer_prev: str) -> str:
+        """Substitute {r}, {self_prev}, {peer_prev} into the template using str.replace.
+
+        Uses .replace rather than str.format so literal '{...}' inside LLM responses
+        does not raise KeyError. See spec §4 for the slot semantics.
+        """
+        return (
+            template
+            .replace("{r}", str(r))
+            .replace("{self_prev}", self_prev)
+            .replace("{peer_prev}", peer_prev)
+        )
+
     def _build_input_ids_from_histories(self,system_prompt,discussion_prompt,questions,histories,batch:DataProto,agent_key,max_history_tokens):
         prompts = [
             [
