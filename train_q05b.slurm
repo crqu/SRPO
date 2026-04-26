@@ -146,25 +146,30 @@ if [ "${ALIVE:-0}" -lt "${NUM_NODES}" ]; then
     exit 1
 fi
 
-# Method-specific config
+# Method-specific config. ADV_KL_TO_HERO toggles the SRPO regularizer
+# (KL(pi_adv || pi_hero) on adversary trajectories, scaled by 1/tau = KL_COEF);
+# config default is false, so SRPO arms must enable it explicitly.
 case "$METHOD" in
     srpo_main)
         TRAINER_TYPE="risk_averse"
-        KL_COEF=0.1          # adversary KL regularization = 1/tau, tau=10
+        KL_COEF=0.1          # 1/tau, tau=10
         EXP_NAME="srpo_main_q05b"
         ENTROPY_OVERRIDE="+multi_agent.agents.0.actor.actor.entropy_coeff=0.05"
+        ADV_KL_TO_HERO=true
         ;;
     srpo_reward_only)
         TRAINER_TYPE="risk_averse"
         KL_COEF=0.1
         EXP_NAME="srpo_reward_only_q05b"
         ENTROPY_OVERRIDE=""
+        ADV_KL_TO_HERO=true
         ;;
     ippo|*)
         TRAINER_TYPE="mappo"
         KL_COEF=0.001        # standard PPO default (not applied to rewards by default)
         EXP_NAME="ippo_q05b"
         ENTROPY_OVERRIDE=""
+        ADV_KL_TO_HERO=false
         ;;
 esac
 
@@ -199,6 +204,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         data.max_response_length=512 \
         data.seed=42 \
         multi_agent.trainer_type=${TRAINER_TYPE} \
+        multi_agent.adversary_kl_to_hero=${ADV_KL_TO_HERO} \
         multi_agent.agents.0.actor.model.path=${MODEL_NAME} \
         multi_agent.agents.1.actor.model.path=${MODEL_NAME} \
         multi_agent.agents.0.n_gpus_per_node=${GPUS_PER_NODE} \
@@ -210,7 +216,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
         actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
-        actor_rollout_ref.rollout.max_model_len=2048 \
+        actor_rollout_ref.rollout.max_model_len=2560 \
         actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
         actor_rollout_ref.rollout.load_format=safetensors \
         actor_rollout_ref.rollout.calculate_log_probs=true \
