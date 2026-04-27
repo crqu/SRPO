@@ -1754,6 +1754,14 @@ class RayMAPPOTrainer:
         reasoning ability remains anchored to its raw single-round task reward.
         The last round's rewards are the leaf rewards and are unchanged.
 
+        IMPORTANT — num_rounds constraint:
+        The recursion mutates rewards[r+1][a] in place, so for num_rounds >= 4
+        the leaf rewards at round N-1 receive a coefficient of 2^k at depth k,
+        compounding the team reward exponentially. With num_rounds = 3 (the
+        default) the loop runs exactly once with the leaf rewards on the
+        right-hand side, so no compounding occurs. If you ever raise num_rounds
+        above 3, replace this in-place recursion with a precomputed team return.
+
         For the adversarial variant see RayRiskAverseTrainer.back_propogate_reward.
         """
         # Cache scalar rewards: rewards[r][a] shape [B]
@@ -1984,7 +1992,10 @@ class RayMAPPOTrainer:
                 metrics.update({f"train/{k}": v for k, v in diag_metrics.items()})
 
                 # backpropagate reward
-                self.back_propogate_reward(num_rounds,num_agents,round_agent_batches,gamma=1)
+                self.back_propogate_reward(
+                    num_rounds, num_agents, round_agent_batches,
+                    gamma=self.config.algorithm.gamma,
+                )
                 
                 # Apply KL penalty serially — kl_ctrl.update() is not thread-safe
                 if self.config.algorithm.use_kl_in_reward:
@@ -2233,17 +2244,25 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
         Convention: agent 0 = adversary, agent 1 = hero (risk-averse).
 
-        For r in (0, N-1)  (i.e., r in range(N-2, 0, -1) — the discussion middle):
+        For r in [1, N-2]  (the discussion middle):
             hero[r]      = hero[r] + gamma * hero[r+1]    (own discounted return)
             adversary[r] = -hero[r+1]                     (negate hero's future)
 
-        Round 0 is intentionally NOT modified — round 0 is each agent's pure
-        first-pass response to the question (no peer history yet), so we keep
-        the raw task reward to anchor base reasoning ability.
+        For r = 0 (round 0):
+            hero[0]      unchanged                        (anchor base reasoning)
+            adversary[0] = -hero[1]                       (mislead the hero from
+                                                           the very first turn)
 
-        The last round's rewards are the leaf signals and unchanged. This means
-        the adversary at the last round has no SRPO signal — the actor/critic
-        update for the adversary at r=N-1 is skipped in mappo_fit.
+        The last round's rewards are the leaf signals and unchanged. The
+        adversary at r=N-1 has no SRPO signal — its actor/critic update is
+        skipped in mappo_fit via _is_terminal_adversary.
+
+        NOTE: hero[0] is intentionally asymmetric with the rest of the schedule.
+        The hero's round-0 response is its raw, no-peer-context first pass, and
+        anchoring it to the bare task reward keeps base reasoning ability from
+        being overwritten by the discounted-return shaping. The adversary, in
+        contrast, must pursue the SRPO objective at r=0 — it should be misleading
+        the hero from turn one.
         """
         assert num_agents == 2, (
             "RayRiskAverseTrainer.back_propogate_reward requires exactly 2 agents "
@@ -2258,14 +2277,20 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
             for r in range(num_rounds)
         ]
 
-        for r in range(num_rounds - 2, 0, -1):
-            # Hero (agent 1): accumulate discounted future return
-            rewards[r][1] = rewards[r][1] + gamma * rewards[r + 1][1]
-            # Adversary (agent 0): benefit from the hero failing in the next round
+        for r in range(num_rounds - 2, -1, -1):
+            if r > 0:
+                # Hero (agent 1): accumulate discounted future return.
+                # At r=0 we anchor the hero to the raw task reward — see docstring.
+                rewards[r][1] = rewards[r][1] + gamma * rewards[r + 1][1]
+            # Adversary (agent 0) at every r in [0, N-2]: benefit from hero failure
+            # in the next round. Uses the post-update rewards[r+1][1], so the
+            # adversary attacks the hero's full discounted future return.
             rewards[r][0] = -rewards[r + 1][1]
 
-            # Write updated rewards back to the last response token of each agent
-            for a in range(num_agents):
+            # Write updated rewards back to the last response token. At r=0 the
+            # hero is unchanged, so we only need to write the adversary's row.
+            agents_to_write = (0, 1) if r > 0 else (0,)
+            for a in agents_to_write:
                 batch = round_agent_batches[r][a]
                 scores = batch.batch["token_level_scores"]    # [B, T]
                 rmask  = batch.batch["response_mask"].bool()  # [B, T]
@@ -2301,7 +2326,10 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         num_agents = int(ma.get("num_agents", 1))
         num_rounds = int(ma.get("num_rounds", 1))
         risk_coef = float(ma.get("risk_coef", 1.0))
-        adversary_kl_to_hero = bool(ma.get("adversary_kl_to_hero", False))
+        # Default True: the SRPO regularizer (1/tau) * KL(pi_adv || pi_hero) is
+        # the defining feature of this trainer. Override only if you intentionally
+        # want pure min-max with no adversary constraint.
+        adversary_kl_to_hero = bool(ma.get("adversary_kl_to_hero", True))
         agent_keys = list(self.train_dataloaders.keys())
 
         logger = Tracking(

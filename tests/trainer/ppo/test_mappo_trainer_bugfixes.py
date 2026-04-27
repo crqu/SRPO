@@ -165,10 +165,12 @@ def test_risk_averse_has_own_back_propogate_reward():
 
 
 def test_risk_averse_back_propagate_reward_adversarial_values():
-    """SRPO back_propogate_reward at r in [1, N-2]: adversary = -hero[r+1]; hero = own + gamma*hero[r+1].
-
-    Round 0 is intentionally untouched (preserves base reasoning).
-    Last round is the leaf reward and unchanged.
+    """SRPO back_propogate_reward:
+      - r in [1, N-2]: adversary[r] = -hero[r+1] (post-hero-update);
+                       hero[r] = own + gamma * hero[r+1]
+      - r = 0:         adversary[0] = -hero[1] (mislead the hero);
+                       hero[0] unchanged (anchor base reasoning, Q1=(a))
+      - r = N-1:       leaf rewards, unchanged
     """
     trainer = object.__new__(RayRiskAverseTrainer)
     # 3 rounds, 2 agents
@@ -176,8 +178,8 @@ def test_risk_averse_back_propagate_reward_adversarial_values():
     r2a1 = _make_score_batch([30.0, 40.0])   # final round, hero — unchanged
     r1a0 = _make_score_batch([ 5.0,  6.0])   # middle round, adversary
     r1a1 = _make_score_batch([ 7.0,  8.0])   # middle round, hero
-    r0a0 = _make_score_batch([ 1.0,  2.0])   # round 0 — intentionally untouched
-    r0a1 = _make_score_batch([ 3.0,  4.0])   # round 0 — intentionally untouched
+    r0a0 = _make_score_batch([ 1.0,  2.0])   # round 0, adversary — now updated
+    r0a1 = _make_score_batch([ 3.0,  4.0])   # round 0, hero — anchored, unchanged
 
     trainer.back_propogate_reward(
         num_rounds=3, num_agents=2,
@@ -185,16 +187,78 @@ def test_risk_averse_back_propagate_reward_adversarial_values():
         gamma=1.0,
     )
 
-    # Hero (agent 1) at r=1: 7 + 1.0*30 = 37; 8 + 1.0*40 = 48
+    # r=1: hero = 7+30=37, 8+40=48; adversary = -hero_leaf[2] = [-30, -40]
     assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([37.0, 48.0]))
-    # Adversary (agent 0) at r=1: -hero[r=2] = [-30, -40]
     assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([-30.0, -40.0]))
-    # Round 0 intentionally untouched
-    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([1.0, 2.0]))
+    # r=0: adversary = -hero[r=1]_post_update = [-37, -48]; hero unchanged
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([-37.0, -48.0]))
     assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([3.0, 4.0]))
     # Final round unchanged
     assert torch.allclose(r2a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
     assert torch.allclose(r2a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
+
+
+def test_risk_averse_round_0_hero_anchored_adversary_misleads():
+    """SRPO round-0 semantics (Q1=(a)): hero[0] keeps raw task reward; adversary[0] = -hero[1]."""
+    trainer = object.__new__(RayRiskAverseTrainer)
+    r2a0 = _make_score_batch([0.0]);  r2a1 = _make_score_batch([100.0])
+    r1a0 = _make_score_batch([0.0]);  r1a1 = _make_score_batch([0.0])
+    r0a0 = _make_score_batch([7.0]);  r0a1 = _make_score_batch([42.0])
+
+    trainer.back_propogate_reward(
+        num_rounds=3, num_agents=2,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
+        gamma=1.0,
+    )
+    # Hero at r=0 untouched (anchored to base reasoning)
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([42.0]))
+    # Adversary at r=0 = -hero[r=1]_post_update = -(0 + 1.0*100) = -100
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([-100.0]))
+
+
+def test_risk_averse_round_0_with_gamma_lt_1():
+    """SRPO round-0 adversary uses post-update hero[1] which contains gamma*hero_leaf."""
+    trainer = object.__new__(RayRiskAverseTrainer)
+    r2a0 = _make_score_batch([0.0]);  r2a1 = _make_score_batch([100.0])
+    r1a0 = _make_score_batch([0.0]);  r1a1 = _make_score_batch([5.0])
+    r0a0 = _make_score_batch([0.0]);  r0a1 = _make_score_batch([0.0])
+
+    trainer.back_propogate_reward(
+        num_rounds=3, num_agents=2,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
+        gamma=0.5,
+    )
+    # hero[1] = 5 + 0.5*100 = 55; adversary[0] = -55
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([55.0]))
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([-55.0]))
+
+
+def test_risk_averse_default_adversary_kl_to_hero_is_true():
+    """SRPO's adversary_kl_to_hero must default to True (the SRPO regularizer is required)."""
+    src = inspect.getsource(RayRiskAverseTrainer.mappo_fit)
+    assert re.search(
+        r'adversary_kl_to_hero\s*=\s*bool\(\s*ma\.get\(\s*[\'"]adversary_kl_to_hero[\'"]\s*,\s*True\s*\)',
+        src,
+    ), (
+        "RayRiskAverseTrainer.mappo_fit must default adversary_kl_to_hero to True — "
+        "the SRPO KL regularizer is the defining feature of this trainer"
+    )
+
+
+def test_ippo_uses_config_gamma_for_back_propogate_reward():
+    """IPPO mappo_fit must pass gamma=self.config.algorithm.gamma (was hardcoded to 1)."""
+    src = inspect.getsource(RayMAPPOTrainer.mappo_fit)
+    assert re.search(
+        r"self\.back_propogate_reward\([^)]*gamma\s*=\s*self\.config\.algorithm\.gamma",
+        src, re.DOTALL,
+    ), (
+        "IPPO mappo_fit must call back_propogate_reward with gamma=self.config.algorithm.gamma "
+        "to stay consistent with SRPO if gamma is ever tuned"
+    )
+    assert not re.search(
+        r"self\.back_propogate_reward\([^)]*gamma\s*=\s*1\b",
+        src, re.DOTALL,
+    ), "IPPO mappo_fit must not hardcode gamma=1"
 
 
 def test_risk_averse_mappo_fit_calls_back_propogate_reward():
