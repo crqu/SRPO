@@ -69,6 +69,10 @@ PROBE_PARTNER_WG_NAME = f"actor_rollout_{PROBE_PARTNER_KEY}"
 # any trained slot (0..num_agents-1) so log filters on agent_index can exclude it.
 PROBE_PARTNER_AGENT_INDEX = 99
 
+# Sentinel used by RayRiskAverseTrainer._apply_kl_penalty to distinguish
+# "key was not set" from "key was set to None" when restoring meta_info.
+_MISSING = object()
+
 
 def _extract_final_answer(text: str) -> str | None:
     """Return the substring after the last '####', stripped. None if marker absent."""
@@ -2170,32 +2174,25 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         self,
         adv_data: DataProto,
         hero_actor_wg,
-        kl_ctrl: core_algos.AdaptiveKLController,
+        risk_coef: float,
         kl_penalty: str = "kl",
     ):
         """SRPO adversary KL regularizer: penalize KL(pi_adv || pi_hero) on adv samples.
 
-        Implements the regularizer from the SRPO paper (eq. 9):
-            adversary_loss -= (1/tau) * KL(pi_adv || pi_hero),
+        Implements the regularizer from the SRPO paper:
+            adversary_loss -= risk_coef * KL(pi_adv || pi_hero),
         with the k1 estimator
-            KL(pi_adv || pi_hero) ≈ E_{t~pi_adv at s~adv}[ log pi_adv(t|s) - log pi_hero(t|s) ].
+            KL(pi_adv || pi_hero) ~= log pi_adv(t|s) - log pi_hero(t|s)
+        evaluated on the adversary's own rollout (state, token) pairs.
 
-        Both logprobs must be evaluated on the SAME (state, token) pairs — the
-        adversary's own rollout. `adv_data["old_log_probs"]` already holds
-        log pi_adv(t_adv | s_adv); we obtain log pi_hero(t_adv | s_adv) by
-        running the hero actor's FSDP forward on the adversary batch via
-        `hero_actor_wg.compute_log_prob(adv_data)`.
-
-        The previous implementation passed the hero's own rollout batch as
-        `data_ref` and subtracted log pi_hero(t_hero | s_hero) from
-        log pi_adv(t_adv | s_adv) — logprobs of different random variables at
-        different states. That quantity is not a divergence and only reflected
-        rollout sampling noise (~1e-2 between two near-identical LoRA checkpoints).
+        risk_coef is a fixed scalar (the SRPO 1/tau in the paper). No adaptive
+        controller is used here; the hero->ref penalty (apply_kl_penalty) keeps
+        its own controller (self.kl_ctrl_in_reward).
 
         Args:
             adv_data: Adversary (agent 0) rollout batch — receives the KL penalty.
             hero_actor_wg: RayWorkerGroup wrapping the hero (agent 1) actor.
-            kl_ctrl: KL coefficient controller; `kl_ctrl.value` is `1/tau`.
+            risk_coef: Fixed multiplier on the KL term (>= 0).
             kl_penalty: Estimator name forwarded to `core_algos.kl_penalty`
                 ("kl"/"k1", "abs", "mse"/"k2", "low_var_kl"/"k3").
 
@@ -2204,34 +2201,38 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         """
         response_mask = adv_data.batch["response_mask"]
         token_level_scores = adv_data.batch["token_level_scores"]
-        batch_size = adv_data.batch.batch_size[0]
         adv_log_probs = adv_data.batch["old_log_probs"]
 
-        # Evaluate hero policy on adversary trajectories. compute_log_prob runs
-        # an FSDP forward of the hero actor (LoRA-adapted, since is_lora is not
-        # set) on adv_data's input_ids and returns `old_log_probs` =
-        # log pi_hero(t_adv | s_adv). The hero actor is FSDP-resident in GPU
-        # regardless of vLLM sleep state, so this is independent of cumem.
-        hero_lp_proto = hero_actor_wg.compute_log_prob(adv_data)
+        # compute_log_prob mutates adv_data.meta_info; snapshot and restore.
+        _restore_keys = ("micro_batch_size", "max_token_len", "use_dynamic_bsz", "temperature")
+        _saved = {k: adv_data.meta_info.get(k, _MISSING) for k in _restore_keys}
+
+        try:
+            hero_lp_proto = hero_actor_wg.compute_log_prob(adv_data)
+        finally:
+            for k, v in _saved.items():
+                if v is _MISSING:
+                    adv_data.meta_info.pop(k, None)
+                else:
+                    adv_data.meta_info[k] = v
+
         hero_log_probs = hero_lp_proto.batch["old_log_probs"].to(adv_log_probs.device)
 
         kld = core_algos.kl_penalty(adv_log_probs, hero_log_probs, kl_penalty=kl_penalty)
         kld = kld * response_mask
-        beta = kl_ctrl.value  # = 1/tau
 
-        # back_propogate_reward already set adversary scores to -hero_return;
-        # subtracting beta*kld further penalizes drift from the hero policy.
-        token_level_rewards = token_level_scores - beta * kld
+        # back_propogate_reward already set adversary scores to -hero_return at r in [1, N-2];
+        # subtracting risk_coef*kld further penalizes drift from the hero policy.
+        token_level_rewards = token_level_scores - risk_coef * kld
 
         current_kl = masked_mean(kld, mask=response_mask, axis=-1)
         current_kl = torch.mean(current_kl, dim=0).item()
 
-        kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
         adv_data.batch["token_level_rewards"] = token_level_rewards
 
         metrics = {
             "actor/reward_kl_penalty": current_kl,
-            "actor/reward_kl_penalty_coeff": beta,
+            "actor/reward_kl_penalty_coeff": risk_coef,
         }
         return adv_data, metrics
     def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
@@ -2440,15 +2441,18 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
                 # back_propogate_reward (overridden in this class) applies cross-round
                 # adversarial discounting; the SRPO regularizer below optionally
                 # constrains the adversary near the hero's policy.
-                self.back_propogate_reward(num_rounds, num_agents, round_agent_batches, gamma=risk_coef)
+                self.back_propogate_reward(
+                    num_rounds, num_agents, round_agent_batches,
+                    gamma=self.config.algorithm.gamma,
+                )
                 if adversary_kl_to_hero:
                     hero_actor_wg = self.actor_rollout_wgs[agent_keys[1]]
                     for r in range(num_rounds):
                         round_agent_batches[r][0], kl_metrics = self._apply_kl_penalty(
-                            round_agent_batches[r][0],
-                            hero_actor_wg,
-                            self.kl_ctrl_in_reward,
-                            self.config.algorithm.kl_penalty,
+                            adv_data=round_agent_batches[r][0],
+                            hero_actor_wg=hero_actor_wg,
+                            risk_coef=risk_coef,
+                            kl_penalty=self.config.algorithm.kl_penalty,
                         )
                         round_agent_metrics[r][0].update(kl_metrics)
                 else:

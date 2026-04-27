@@ -36,11 +36,15 @@ multi_agent:
     - Peer's previous response: {peer_prev}
     Now produce your round-{r} response.
 
-  # SRPO-only: apply (1/tau) * KL(pi_adv || pi_hero) regularizer to the
+  # SRPO-only: apply risk_coef * KL(pi_adv || pi_hero) regularizer to the
   # adversary's token-level reward, evaluated on adversary trajectories with
-  # the hero policy's logprobs. Only consulted by RayRiskAverseTrainer; tau is
-  # the reciprocal of algorithm.kl_ctrl.kl_coef.
+  # the hero policy's logprobs. Only consulted by RayRiskAverseTrainer.
   adversary_kl_to_hero: false
+
+  # SRPO-only: fixed scalar multiplier on the adversary->hero KL term in
+  # _apply_kl_penalty. Corresponds to 1/tau in the SRPO paper. Distinct from
+  # algorithm.gamma (which is the discount factor used in back_propogate_reward).
+  risk_coef: 1.0
 
   # Cross-pair probe: load a frozen partner from `partner_ckpt_dir` and run
   # rollouts that swap it in for one of the trained agents. The probe is now
