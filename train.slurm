@@ -193,7 +193,7 @@ case "$METHOD" in
         TRAINER_TYPE="risk_averse"
         KL_COEF=0.1          # 1/tau, tau=10
         EXP_NAME="srpo_main_${MODEL}_seed${SEED}"
-        ENTROPY_OVERRIDE="+multi_agent.agents.0.actor.actor.entropy_coeff=0.05"
+        ENTROPY_OVERRIDE="+multi_agent.agents.0.actor.actor.entropy_coeff=0.01"
         ADV_KL_TO_HERO=true
         ;;
     srpo_reward_only)
