@@ -403,3 +403,35 @@ def test_risk_averse_mappo_fit_skip_uses_is_terminal_adversary():
     assert not re.search(r"r == num_rounds - 1 and agent_idx == 1", src), (
         "mappo_fit must not skip agent_idx == 1 (the hero) — it must skip the adversary (agent 0) at the last round"
     )
+
+
+# ---------------------------------------------------------------------------
+# D5 regression: raw rollout scores must be captured BEFORE back_propogate_reward
+# ---------------------------------------------------------------------------
+
+def test_base_mappo_fit_diag_before_back_propogate():
+    """RayMAPPOTrainer.mappo_fit must build diag_correctness BEFORE back_propogate_reward.
+
+    Otherwise the per-step accuracy metric reflects shaped (cumulative) rewards,
+    not raw rollout correctness.
+    """
+    src = inspect.getsource(RayMAPPOTrainer.mappo_fit)
+    diag_pos = src.find("diag_metrics = _compute_cheap_diagnostics(")
+    backprop_pos = src.find("self.back_propogate_reward(")
+    assert diag_pos != -1 and backprop_pos != -1
+    assert diag_pos < backprop_pos, (
+        "diag_metrics must be computed before back_propogate_reward — otherwise "
+        "the accuracy metric reflects shaped rewards, not raw rollout correctness"
+    )
+
+
+def test_srpo_mappo_fit_diag_before_back_propogate():
+    """RayRiskAverseTrainer.mappo_fit must build diag_correctness BEFORE back_propogate_reward."""
+    src = inspect.getsource(RayRiskAverseTrainer.mappo_fit)
+    diag_pos = src.find("diag_metrics = _compute_cheap_diagnostics(")
+    backprop_pos = src.find("self.back_propogate_reward(")
+    assert diag_pos != -1 and backprop_pos != -1
+    assert diag_pos < backprop_pos, (
+        "diag_metrics must be computed before back_propogate_reward — otherwise "
+        "agent_0 (adversary) accuracy will reflect -hero_return, not its own correctness"
+    )
