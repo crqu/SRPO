@@ -165,26 +165,36 @@ def test_risk_averse_has_own_back_propogate_reward():
 
 
 def test_risk_averse_back_propagate_reward_adversarial_values():
-    """RayRiskAverseTrainer.back_propogate_reward: agent 0=adversary gets negated hero reward; agent 1=hero accumulates (B7)."""
+    """SRPO back_propogate_reward at r in [1, N-2]: adversary = -hero[r+1]; hero = own + gamma*hero[r+1].
+
+    Round 0 is intentionally untouched (preserves base reasoning).
+    Last round is the leaf reward and unchanged.
+    """
     trainer = object.__new__(RayRiskAverseTrainer)
-    r1a0 = _make_score_batch([10.0, 20.0])   # final round, adversary (agent 0) — unchanged
-    r1a1 = _make_score_batch([30.0, 40.0])   # final round, hero (agent 1)
-    r0a0 = _make_score_batch([ 1.0,  2.0])   # round 0, adversary
-    r0a1 = _make_score_batch([ 3.0,  4.0])   # round 0, hero
+    # 3 rounds, 2 agents
+    r2a0 = _make_score_batch([10.0, 20.0])   # final round, adversary — unchanged
+    r2a1 = _make_score_batch([30.0, 40.0])   # final round, hero — unchanged
+    r1a0 = _make_score_batch([ 5.0,  6.0])   # middle round, adversary
+    r1a1 = _make_score_batch([ 7.0,  8.0])   # middle round, hero
+    r0a0 = _make_score_batch([ 1.0,  2.0])   # round 0 — intentionally untouched
+    r0a1 = _make_score_batch([ 3.0,  4.0])   # round 0 — intentionally untouched
 
     trainer.back_propogate_reward(
-        num_rounds=2, num_agents=2,
-        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1]],
+        num_rounds=3, num_agents=2,
+        round_agent_batches=[[r0a0, r0a1], [r1a0, r1a1], [r2a0, r2a1]],
         gamma=1.0,
     )
 
-    # Hero (agent 1) at r=0: 3 + 30 = 33, 4 + 40 = 44
-    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([33.0, 44.0]))
-    # Adversary (agent 0) at r=0: -hero's next round = [-30, -40]
-    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([-30.0, -40.0]))
+    # Hero (agent 1) at r=1: 7 + 1.0*30 = 37; 8 + 1.0*40 = 48
+    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([37.0, 48.0]))
+    # Adversary (agent 0) at r=1: -hero[r=2] = [-30, -40]
+    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([-30.0, -40.0]))
+    # Round 0 intentionally untouched
+    assert torch.allclose(r0a0.batch["token_level_scores"][:, 3], torch.tensor([1.0, 2.0]))
+    assert torch.allclose(r0a1.batch["token_level_scores"][:, 3], torch.tensor([3.0, 4.0]))
     # Final round unchanged
-    assert torch.allclose(r1a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
-    assert torch.allclose(r1a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
+    assert torch.allclose(r2a0.batch["token_level_scores"][:, 3], torch.tensor([10.0, 20.0]))
+    assert torch.allclose(r2a1.batch["token_level_scores"][:, 3], torch.tensor([30.0, 40.0]))
 
 
 def test_risk_averse_mappo_fit_calls_back_propogate_reward():

@@ -2223,16 +2223,21 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         }
         return adv_data, metrics
     def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
-        """Propagate rewards with adversarial back-prop.
+        """Propagate adversarial returns through discussion rounds (SRPO).
 
-        RayRiskAverseTrainer convention: agent 0 = adversary, agent 1 = hero (risk-averse).
+        Convention: agent 0 = adversary, agent 1 = hero (risk-averse).
 
-        Hero (agent 1): accumulates discounted future return.
-            rewards[r][1] = rewards[r][1] + gamma * rewards[r+1][1]
-        Adversary (agent 0): rewarded for making the hero fail in the next round.
-            rewards[r][0] = -rewards[r+1][1]
+        For r in (0, N-1)  (i.e., r in range(N-2, 0, -1) — the discussion middle):
+            hero[r]      = hero[r] + gamma * hero[r+1]    (own discounted return)
+            adversary[r] = -hero[r+1]                     (negate hero's future)
 
-        The last round's rewards are unchanged for both agents.
+        Round 0 is intentionally NOT modified — round 0 is each agent's pure
+        first-pass response to the question (no peer history yet), so we keep
+        the raw task reward to anchor base reasoning ability.
+
+        The last round's rewards are the leaf signals and unchanged. This means
+        the adversary at the last round has no SRPO signal — the actor/critic
+        update for the adversary at r=N-1 is skipped in mappo_fit.
         """
         assert num_agents == 2, (
             "RayRiskAverseTrainer.back_propogate_reward requires exactly 2 agents "
