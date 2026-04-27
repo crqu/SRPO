@@ -2154,6 +2154,18 @@ class RayMAPPOTrainer:
 class RayRiskAverseTrainer(RayMAPPOTrainer):
     """MAPPO variant with shared discussion prompts and an adversarial agent."""
 
+    @staticmethod
+    def _is_terminal_adversary(r: int, agent_idx: int, num_rounds: int) -> bool:
+        """True if (r, agent_idx) is the SRPO terminal-round adversary slot.
+
+        SRPO back_propogate_reward leaves the adversary's last-round reward as the
+        raw rollout score (there is no `hero[r+1]` to negate). To avoid training
+        the adversary as a cooperator at the last round, the actor and critic
+        updates for that slot are skipped. The hero at the last round is updated
+        normally (its leaf reward is the proper task reward).
+        """
+        return r == num_rounds - 1 and agent_idx == 0
+
     def _apply_kl_penalty(
         self,
         adv_data: DataProto,
@@ -2509,7 +2521,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx, agent_key in enumerate(agent_keys):
-                                if r == num_rounds - 1 and agent_idx == 1:
+                                if self._is_terminal_adversary(r, agent_idx, num_rounds):
                                     continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(
@@ -2531,7 +2543,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
                         with ThreadPoolExecutor(max_workers=num_agents) as executor:
                             for agent_idx, agent_key in enumerate(agent_keys):
-                                if r == num_rounds - 1 and agent_idx == 1:
+                                if self._is_terminal_adversary(r, agent_idx, num_rounds):
                                     continue  # adversary has no future signal at final round
                                 futures.append(
                                     executor.submit(

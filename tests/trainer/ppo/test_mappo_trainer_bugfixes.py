@@ -369,3 +369,37 @@ def test_agent_pool_colocate_count_is_one_not_internal_worker_count():
         "Setting it to colocate_per_agent caused fractional num_gpus=0.5 and "
         "CUDA-not-available crashes on multi-node SLURM runs."
     )
+
+
+# ---------------------------------------------------------------------------
+# Last-round skip: SRPO must skip ADVERSARY (agent 0) at r = num_rounds - 1
+# ---------------------------------------------------------------------------
+
+def test_is_terminal_adversary_helper_exists():
+    """RayRiskAverseTrainer._is_terminal_adversary must exist and be a staticmethod."""
+    assert hasattr(RayRiskAverseTrainer, "_is_terminal_adversary"), (
+        "RayRiskAverseTrainer must define a _is_terminal_adversary helper"
+    )
+
+
+def test_is_terminal_adversary_returns_true_only_for_agent0_at_last_round():
+    """_is_terminal_adversary returns True iff (r == num_rounds - 1 and agent_idx == 0)."""
+    fn = RayRiskAverseTrainer._is_terminal_adversary
+    assert fn(r=2, agent_idx=0, num_rounds=3) is True
+    assert fn(r=2, agent_idx=1, num_rounds=3) is False  # hero is NOT skipped
+    assert fn(r=1, agent_idx=0, num_rounds=3) is False
+    assert fn(r=0, agent_idx=0, num_rounds=3) is False
+    assert fn(r=0, agent_idx=1, num_rounds=3) is False
+
+
+def test_risk_averse_mappo_fit_skip_uses_is_terminal_adversary():
+    """RayRiskAverseTrainer.mappo_fit critic+actor skip sites must call _is_terminal_adversary, not hardcode agent_idx==1."""
+    src = inspect.getsource(RayRiskAverseTrainer.mappo_fit)
+    assert "_is_terminal_adversary(" in src, (
+        "mappo_fit critic+actor skip sites must call self._is_terminal_adversary(...) "
+        "instead of hardcoding the agent index"
+    )
+    # Belt-and-suspenders: make sure the buggy hero-skip is gone.
+    assert not re.search(r"r == num_rounds - 1 and agent_idx == 1", src), (
+        "mappo_fit must not skip agent_idx == 1 (the hero) — it must skip the adversary (agent 0) at the last round"
+    )
