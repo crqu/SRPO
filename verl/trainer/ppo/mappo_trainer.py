@@ -2338,7 +2338,6 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-        self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         # we start from step 1
         self.global_steps += 1

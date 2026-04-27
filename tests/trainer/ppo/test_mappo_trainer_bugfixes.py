@@ -435,3 +435,19 @@ def test_srpo_mappo_fit_diag_before_back_propogate():
         "diag_metrics must be computed before back_propogate_reward — otherwise "
         "agent_0 (adversary) accuracy will reflect -hero_return, not its own correctness"
     )
+
+
+# ---------------------------------------------------------------------------
+# kl_ctrl_in_reward must not be re-instantiated inside mappo_fit
+# ---------------------------------------------------------------------------
+
+def test_risk_averse_mappo_fit_does_not_reinstantiate_kl_ctrl_in_reward():
+    """RayRiskAverseTrainer.mappo_fit must not reassign self.kl_ctrl_in_reward.
+
+    Re-instantiation would wipe adaptive KL state across calls.
+    """
+    src = inspect.getsource(RayRiskAverseTrainer.mappo_fit)
+    assert "self.kl_ctrl_in_reward = " not in src, (
+        "RayRiskAverseTrainer.mappo_fit must not reassign self.kl_ctrl_in_reward — "
+        "create it once in __init__"
+    )
