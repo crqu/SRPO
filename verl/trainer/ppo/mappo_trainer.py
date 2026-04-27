@@ -2235,6 +2235,7 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
             "actor/reward_kl_penalty_coeff": risk_coef,
         }
         return adv_data, metrics
+
     def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
         """Propagate adversarial returns through discussion rounds (SRPO).
 
