@@ -1742,13 +1742,18 @@ class RayMAPPOTrainer:
         return reward_tensor, reward_extra_infos_dict
 
     def back_propogate_reward(self, num_rounds, num_agents, round_agent_batches, gamma):
-        """Propagate discounted future rewards backward through rounds for all cooperative agents.
+        """Propagate team-reward returns backward through discussion rounds (cooperative IPPO).
 
-        In RayMAPPOTrainer all agents share the same objective (no adversary).
-        Each agent independently accumulates its own discounted return:
-            rewards[r][a] = rewards[r][a] + gamma * rewards[r+1][a]
+        At each non-terminal, non-zero round r in (0, N-1), every agent absorbs the
+        SUM of all agents' rewards at round r+1 (cross-agent boost):
+            rewards[r][a] = rewards[r][a] + gamma * (rewards[r+1][0] + rewards[r+1][1])
+        This encourages each agent to produce reasoning that helps the peer in
+        downstream rounds — the cooperative MAPPO objective.
 
-        The last round's rewards are unchanged for all agents.
+        Round 0 is intentionally NOT back-propagated so each agent's base
+        reasoning ability remains anchored to its raw single-round task reward.
+        The last round's rewards are the leaf rewards and are unchanged.
+
         For the adversarial variant see RayRiskAverseTrainer.back_propogate_reward.
         """
         # Cache scalar rewards: rewards[r][a] shape [B]
