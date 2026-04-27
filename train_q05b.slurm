@@ -147,26 +147,29 @@ if [ "${ALIVE:-0}" -lt "${NUM_NODES}" ]; then
 fi
 
 # Method-specific config. ADV_KL_TO_HERO toggles the SRPO regularizer
-# (KL(pi_adv || pi_hero) on adversary trajectories, scaled by 1/tau = KL_COEF);
-# config default is false, so SRPO arms must enable it explicitly.
+# (KL(pi_adv || pi_hero) on adversary trajectories, scaled by 1/tau = RISK_COEF
+# wired into multi_agent.risk_coef). We do NOT set algorithm.kl_ctrl.kl_coef
+# here — that controller drives the hero->ref penalty, which is gated by
+# algorithm.use_kl_in_reward (default False). For IPPO arms, RISK_COEF is
+# unused (ADV_KL_TO_HERO=false ⇒ _apply_kl_penalty is never called).
 case "$METHOD" in
     srpo_main)
         TRAINER_TYPE="risk_averse"
-        KL_COEF=0.1          # 1/tau, tau=10
+        RISK_COEF=0.1          # 1/tau, tau=10
         EXP_NAME="srpo_main_q05b"
         ENTROPY_OVERRIDE="+multi_agent.agents.0.actor.actor.entropy_coeff=0.05"
         ADV_KL_TO_HERO=true
         ;;
     srpo_reward_only)
         TRAINER_TYPE="risk_averse"
-        KL_COEF=0.1
+        RISK_COEF=0.1
         EXP_NAME="srpo_reward_only_q05b"
         ENTROPY_OVERRIDE=""
         ADV_KL_TO_HERO=true
         ;;
     ippo|*)
         TRAINER_TYPE="mappo"
-        KL_COEF=0.001        # standard PPO default (not applied to rewards by default)
+        RISK_COEF=1.0          # unused for IPPO (ADV_KL_TO_HERO=false)
         EXP_NAME="ippo_q05b"
         ENTROPY_OVERRIDE=""
         ADV_KL_TO_HERO=false
@@ -230,7 +233,7 @@ PYTHONUNBUFFERED=1 srun --overlap --nodes=1 --ntasks=1 -w "$head_node" \
         critic.model.path=${MODEL_NAME} \
         critic.optim.lr=1e-5 \
         critic.ppo_micro_batch_size_per_gpu=32 \
-        algorithm.kl_ctrl.kl_coef=${KL_COEF} \
+        multi_agent.risk_coef=${RISK_COEF} \
         trainer.total_training_steps=200 \
         trainer.test_freq=20 \
         trainer.save_freq=50 \
