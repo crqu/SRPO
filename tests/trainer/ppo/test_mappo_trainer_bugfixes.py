@@ -315,3 +315,29 @@ def test_init_resource_pool_mgr_passes_colocate_count_dict():
     assert "colocate_count_dict" in src, (
         "init_resource_pool_mgr must compute colocate_count_dict and pass it to ResourcePoolManager"
     )
+
+
+def test_agent_pool_colocate_count_is_one_not_internal_worker_count():
+    """agent_pool_{i} must use max_colocate_count=1, not the count of internal logical workers.
+
+    create_colocated_worker_cls bundles actor+critic+ref into ONE WorkerDict Ray actor
+    per bundle. max_colocate_count controls num_gpus = 1/N for that single Ray actor
+    (verl/single_controller/ray/base.py:628). Using N>1 produces fractional GPU
+    allocation (e.g. 0.5 for actor+critic), which does not reliably set
+    CUDA_VISIBLE_DEVICES on the worker node in this Ray+SLURM environment — see
+    docs/superpowers/plans/2026-04-12-mappo-cuda-visibility-fix.md.
+
+    Per-agent_pool max_colocate_count must be 1 so each WorkerDict gets a full
+    integer GPU.
+    """
+    src = inspect.getsource(TaskRunner.init_resource_pool_mgr)
+    # The line must assign a literal 1 (not colocate_per_agent or any other value).
+    assert re.search(
+        r'colocate_count_dict\[\s*f?["\']agent_pool_\{i\}["\']\s*\]\s*=\s*1\b',
+        src,
+    ), (
+        "agent_pool_{i} colocate_count must be set to literal 1 (one Ray actor per bundle, "
+        "regardless of how many internal logical workers it contains). "
+        "Setting it to colocate_per_agent caused fractional num_gpus=0.5 and "
+        "CUDA-not-available crashes on multi-node SLURM runs."
+    )

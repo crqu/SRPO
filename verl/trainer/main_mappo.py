@@ -199,14 +199,18 @@ class TaskRunner:
                 f"with num_agents={num_agents}. Increase trainer.nnodes or reduce num_agents."
             )
 
-        # Compute actual co-location count: actor_rollout always, plus critic and ref if enabled.
-        colocate_per_agent = 1 + int(need_critic(config)) + int(need_reference_policy(config))
-
+        # max_colocate_count drives num_gpus = 1/N per Ray actor (see
+        # verl/single_controller/ray/base.py:_create_worker). For MAPPO,
+        # create_colocated_worker_cls bundles actor+critic(+ref) into ONE WorkerDict
+        # Ray actor per bundle, so N=1 (full integer GPU). Setting it to the count
+        # of internal logical workers (e.g. 2 for actor+critic) re-introduces the
+        # fractional-GPU bug from docs/superpowers/plans/2026-04-12-mappo-cuda-visibility-fix.md
+        # which crashes the worker-node actor with "no CUDA accelerator available".
         for i in range(num_agents):
             a = agents_cfg[i]
             n_gpus = int(a.get("n_gpus_per_node", config.trainer.n_gpus_per_node))
             resource_pool_spec[f"agent_pool_{i}"] = [n_gpus] * nodes_per_agent
-            colocate_count_dict[f"agent_pool_{i}"] = colocate_per_agent
+            colocate_count_dict[f"agent_pool_{i}"] = 1
             self.mapping[f"agent_pool_{i}"] = f"agent_pool_{i}"
             self.mapping[f"critic_pool_{i}"] = f"agent_pool_{i}"
 
