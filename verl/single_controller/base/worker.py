@@ -188,6 +188,32 @@ class Worker(WorkerHelper):
         # construct a meta from environment variable. Note that the import must be inside the class because
         # it is executed remotely
         import os
+        import socket
+
+        # DIAGNOSTIC: dump CVD / Ray accel / torch.cuda state on actor entry so
+        # we can see exactly what the actor process inherits when MAPPO multi-node
+        # init crashes with "no CUDA accelerator". Remove once root cause is found.
+        try:
+            import torch as _t
+            _cuda_avail = _t.cuda.is_available()
+            _cuda_count = _t.cuda.device_count() if _cuda_avail else 0
+        except Exception as _e:  # noqa: BLE001
+            _cuda_avail, _cuda_count = f"err:{_e}", -1
+        try:
+            import ray as _ray
+            _accel_ids = _ray.get_runtime_context().get_accelerator_ids()
+        except Exception as _e:  # noqa: BLE001
+            _accel_ids = f"err:{_e}"
+        print(
+            f"[WORKER-DIAG] host={socket.gethostname()} pid={os.getpid()} "
+            f"CVD={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')!r} "
+            f"HIP={os.environ.get('HIP_VISIBLE_DEVICES', '<unset>')!r} "
+            f"ROCR={os.environ.get('ROCR_VISIBLE_DEVICES', '<unset>')!r} "
+            f"OVERRIDE_ON_ZERO={os.environ.get('RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO', '<unset>')!r} "
+            f"NOSET_CVD={os.environ.get('RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES', '<unset>')!r} "
+            f"accel_ids={_accel_ids} cuda_avail={_cuda_avail} cuda_count={_cuda_count}",
+            flush=True,
+        )
 
         self._setup_env_cuda_visible_devices()
 

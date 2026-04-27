@@ -27,7 +27,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=l02,l04,l05,l06
+#SBATCH --exclude=n04,n15
 
 set -x
 
@@ -49,13 +49,13 @@ case "$MODEL" in
         MODEL_NAME="Qwen/Qwen2.5-0.5B-Instruct"
         TOTAL_STEPS=250
         NNODES=2; GPUS_PER_NODE=1; TP_SIZE=1
-        MICRO_BSZ=32; GMU=0.6
+        MICRO_BSZ=16; GMU=0.4
         ;;
     q06b)
         MODEL_NAME="Qwen/Qwen3-0.6B"
         TOTAL_STEPS=250
         NNODES=2; GPUS_PER_NODE=1; TP_SIZE=1
-        MICRO_BSZ=32; GMU=0.6
+        MICRO_BSZ=16; GMU=0.4
         ;;
     q3b)
         MODEL_NAME="Qwen/Qwen2.5-3B-Instruct"
@@ -145,9 +145,14 @@ ip_head="${head_node_ip}:${port}"
 export ip_head
 echo "[INFO] Ray head: $ip_head"
 
-# Start Ray head
-srun --nodes=1 --ntasks=1 -w "$head_node" \
+# Start Ray head.
+# --gres=gpu:N on the inner srun is required: without it, SLURM may not set
+# CUDA_VISIBLE_DEVICES for the step on the worker node, so the raylet's
+# accelerator manager assigns phantom GPU ids and Ray actors land with empty
+# or wrong CVD ("get_device_id() called but no CUDA accelerator available").
+srun --nodes=1 --ntasks=1 --gres=gpu:${GPUS_PER_NODE} -w "$head_node" \
     bash -c "unset ROCR_VISIBLE_DEVICES; \
+        echo \"[DEBUG] head raylet on \$(hostname) CVD=\$CUDA_VISIBLE_DEVICES\"; \
         ray start --head --node-ip-address=${head_node_ip} --port=${port} \
         --num-cpus=${CPUS_PER_TASK} --num-gpus=${GPUS_PER_NODE} --block" &
 sleep 20
@@ -157,8 +162,9 @@ worker_num=$((NUM_NODES - 1))
 for ((i = 1; i <= worker_num; i++)); do
     node_i=${nodes_array[$i]}
     echo "[INFO] Starting worker $i at $node_i"
-    srun --nodes=1 --ntasks=1 -w "$node_i" \
+    srun --nodes=1 --ntasks=1 --gres=gpu:${GPUS_PER_NODE} -w "$node_i" \
         bash -c "unset ROCR_VISIBLE_DEVICES; \
+            echo \"[DEBUG] worker raylet on \$(hostname) CVD=\$CUDA_VISIBLE_DEVICES\"; \
             ray start --address=${ip_head} \
             --num-cpus=${CPUS_PER_TASK} --num-gpus=${GPUS_PER_NODE} --block" &
 done
