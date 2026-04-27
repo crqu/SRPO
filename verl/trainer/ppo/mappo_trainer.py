@@ -69,10 +69,6 @@ PROBE_PARTNER_WG_NAME = f"actor_rollout_{PROBE_PARTNER_KEY}"
 # any trained slot (0..num_agents-1) so log filters on agent_index can exclude it.
 PROBE_PARTNER_AGENT_INDEX = 99
 
-# Sentinel used by RayRiskAverseTrainer._apply_kl_penalty to distinguish
-# "key was not set" from "key was set to None" when restoring meta_info.
-_MISSING = object()
-
 
 def _extract_final_answer(text: str) -> str | None:
     """Return the substring after the last '####', stripped. None if marker absent."""
@@ -2203,18 +2199,14 @@ class RayRiskAverseTrainer(RayMAPPOTrainer):
         token_level_scores = adv_data.batch["token_level_scores"]
         adv_log_probs = adv_data.batch["old_log_probs"]
 
-        # compute_log_prob mutates adv_data.meta_info; snapshot and restore.
-        _restore_keys = ("micro_batch_size", "max_token_len", "use_dynamic_bsz", "temperature")
-        _saved = {k: adv_data.meta_info.get(k, _MISSING) for k in _restore_keys}
-
+        # compute_log_prob mutates adv_data.meta_info in place; snapshot the
+        # full dict so any key it touches (now or in the future) is restored.
+        _saved_meta = dict(adv_data.meta_info)
         try:
             hero_lp_proto = hero_actor_wg.compute_log_prob(adv_data)
         finally:
-            for k, v in _saved.items():
-                if v is _MISSING:
-                    adv_data.meta_info.pop(k, None)
-                else:
-                    adv_data.meta_info[k] = v
+            adv_data.meta_info.clear()
+            adv_data.meta_info.update(_saved_meta)
 
         hero_log_probs = hero_lp_proto.batch["old_log_probs"].to(adv_log_probs.device)
 

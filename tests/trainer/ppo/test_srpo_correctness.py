@@ -5,45 +5,23 @@ import re
 from unittest.mock import MagicMock
 
 import torch
-import pytest
 
-from verl import DataProto
 from verl.trainer.ppo.mappo_trainer import RayRiskAverseTrainer
-
-
-class _StubBatch:
-    """Dict-like with a .batch_size attribute, mimicking DataProto.batch."""
-
-    def __init__(self, d, batch_size):
-        self._d = d
-        self.batch_size = batch_size
-
-    def __getitem__(self, k):
-        return self._d[k]
-
-    def __setitem__(self, k, v):
-        self._d[k] = v
-
-    def __contains__(self, k):
-        return k in self._d
 
 
 def _make_adv_data(adv_log_probs, scores_at_last_token, T=4, resp_pos=3):
     """Build a minimal DataProto-like object for _apply_kl_penalty."""
     B = adv_log_probs.shape[0]
-    response_mask = torch.ones(B, T)  # all response tokens active
+    response_mask = torch.ones(B, T)
     scores = torch.zeros(B, T)
     for b, v in enumerate(scores_at_last_token):
         scores[b, resp_pos] = v
     obj = MagicMock()
-    obj.batch = _StubBatch(
-        {
-            "old_log_probs": adv_log_probs,
-            "response_mask": response_mask,
-            "token_level_scores": scores,
-        },
-        batch_size=(B,),
-    )
+    obj.batch = {
+        "old_log_probs": adv_log_probs,
+        "response_mask": response_mask,
+        "token_level_scores": scores,
+    }
     obj.meta_info = {
         "micro_batch_size": 99,
         "max_token_len": 1234,
@@ -117,11 +95,14 @@ def test_apply_kl_penalty_kl_direction_and_sign():
 
 
 def test_apply_kl_penalty_does_not_mutate_adv_data_meta_info():
-    """_apply_kl_penalty must restore adv_data.meta_info after compute_log_prob's side effects."""
+    """_apply_kl_penalty must restore adv_data.meta_info to its full pre-call state."""
     trainer = object.__new__(RayRiskAverseTrainer)
     adv_lp = torch.zeros(1, 4)
     hero_lp = torch.zeros(1, 4)
     adv_data = _make_adv_data(adv_log_probs=adv_lp, scores_at_last_token=[0.0])
+    # Add a key compute_log_prob does NOT mutate, to confirm the restore is
+    # full-dict (self-synchronizing) rather than a curated subset.
+    adv_data.meta_info["user_custom_key"] = "preserved"
 
     saved = copy.deepcopy(adv_data.meta_info)
     hero_wg = _make_mock_hero_wg(hero_log_probs=hero_lp)
@@ -129,10 +110,9 @@ def test_apply_kl_penalty_does_not_mutate_adv_data_meta_info():
         adv_data=adv_data, hero_actor_wg=hero_wg, risk_coef=1.0, kl_penalty="kl"
     )
 
-    for k in ("micro_batch_size", "max_token_len", "use_dynamic_bsz", "temperature"):
-        assert adv_data.meta_info[k] == saved[k], (
-            f"_apply_kl_penalty must restore adv_data.meta_info['{k}'] to its pre-call value"
-        )
+    assert adv_data.meta_info == saved, (
+        "_apply_kl_penalty must restore the entire adv_data.meta_info to its pre-call state"
+    )
 
 
 def test_srpo_mappo_fit_passes_risk_coef_to_apply_kl_penalty():
