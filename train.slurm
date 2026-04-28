@@ -27,7 +27,7 @@
 #SBATCH --output=logs/%x_%j.output
 #SBATCH --error=logs/%x_%j.error
 #SBATCH --export=ALL,ROCR_VISIBLE_DEVICES=
-#SBATCH --exclude=n04,n15
+#SBATCH --exclude=n08
 
 set -x
 
@@ -87,8 +87,10 @@ conda activate srpo
 
 cd "${REPO_DIR}"
 
-echo "[INFO] Cleaning up old Ray processes on all nodes..."
-srun --nodes=${SLURM_JOB_NUM_NODES} --ntasks=${SLURM_JOB_NUM_NODES} bash -c "ray stop -f" || true
+# NOTE: do NOT run `ray stop -f` here. It pgrep-kills every Ray process for
+# this UID on the node, so when two of our jobs share a node the second job's
+# cleanup murders the first job's raylet. Slurm's cgroup teardown handles
+# orphans from this job at exit.
 
 # Download GSM8K data if needed
 if [ ! -f "${GSM8K_TRAIN}" ]; then
@@ -143,7 +145,17 @@ fi
 port=$((6380 + SLURM_JOB_ID % 1000))
 ip_head="${head_node_ip}:${port}"
 export ip_head
+# Pin the trainer's `ray.init()` to THIS job's GCS. Without this, Ray falls
+# back to `<temp_dir>/ray_current_cluster` (default /tmp/ray/...), which our
+# per-job --temp-dir change moved away from the default path; auto-discovery
+# would then fail and ray.init() would spawn a fresh local cluster instead of
+# attaching to the one we just started.
+export RAY_ADDRESS="${ip_head}"
 echo "[INFO] Ray head: $ip_head"
+
+# Per-job temp dir keeps `/tmp/ray/ray_current_cluster` and session metadata
+# from clobbering another job's Ray cluster on a shared node.
+RAY_TEMP_DIR=/tmp/ray-${SLURM_JOB_ID}
 
 # Start Ray head.
 # --gres=gpu:N on the inner srun is required: without it, SLURM may not set
@@ -154,6 +166,7 @@ srun --nodes=1 --ntasks=1 --gres=gpu:${GPUS_PER_NODE} -w "$head_node" \
     bash -c "unset ROCR_VISIBLE_DEVICES; \
         echo \"[DEBUG] head raylet on \$(hostname) CVD=\$CUDA_VISIBLE_DEVICES\"; \
         ray start --head --node-ip-address=${head_node_ip} --port=${port} \
+        --temp-dir=${RAY_TEMP_DIR} \
         --num-cpus=${CPUS_PER_TASK} --num-gpus=${GPUS_PER_NODE} --block" &
 sleep 20
 
@@ -166,6 +179,7 @@ for ((i = 1; i <= worker_num; i++)); do
         bash -c "unset ROCR_VISIBLE_DEVICES; \
             echo \"[DEBUG] worker raylet on \$(hostname) CVD=\$CUDA_VISIBLE_DEVICES\"; \
             ray start --address=${ip_head} \
+            --temp-dir=${RAY_TEMP_DIR} \
             --num-cpus=${CPUS_PER_TASK} --num-gpus=${GPUS_PER_NODE} --block" &
 done
 
