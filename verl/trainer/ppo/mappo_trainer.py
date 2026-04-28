@@ -71,10 +71,16 @@ PROBE_PARTNER_AGENT_INDEX = 99
 
 
 def _extract_final_answer(text: str) -> str | None:
-    """Return the substring after the last '####', stripped. None if marker absent."""
-    if "####" not in text:
-        return None
-    return text.rsplit("####", 1)[1].strip()
+    """Return the parsed numeric answer after the last '####', or None if absent.
+
+    Delegates to the GSM8K strict extractor used by the reward function
+    (verl.utils.reward_score.gsm8k.extract_solution) so the metric and the
+    reward agree on what counts as 'the answer'. Strips commas and dollar
+    signs; ignores trailing prose / units after the number.
+    """
+    from verl.utils.reward_score.gsm8k import extract_solution
+
+    return extract_solution(text, method="strict")
 
 
 def _compute_cheap_diagnostics(
