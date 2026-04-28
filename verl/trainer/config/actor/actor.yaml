@@ -86,7 +86,7 @@ loss_agg_mode: token-mean
 loss_scale_factor: null
 
 # Entropy regularization coefficient in PPO loss
-entropy_coeff: 0.01
+entropy_coeff: 0.001
 
 # When true, the actor forward will request entropy from the model
 calculate_entropy: true
